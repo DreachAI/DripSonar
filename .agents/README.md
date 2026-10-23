@@ -20,6 +20,21 @@ Use a fresh reviewer for independent review; a judge must not have authored a pr
 and design roles do not edit. Only the implementor edits assigned product paths; the validator
 may create isolated test output but must not modify source, fixtures, or expected results.
 
+## Research, design, and delivery
+
+Adapted from `DripYCx26/dreach`'s `.agents/roles/` and `.agents/skills/`; the inspected revision
+is recorded in [DECISIONS.md](../docs/DECISIONS.md).
+
+- **Research:** name the decision a question can change. Inspect existing code and evidence,
+  then reference source and official docs. Keep vendor claims distinct from demonstrated behavior,
+  retain contrary evidence, and stop when the decision has sufficient support.
+- **Design:** consider deletion, reuse, or doing nothing before new machinery. Start with one
+  proposal grounded in actual callers; record the chosen scope, interfaces, and acceptance before
+  implementation. Use a council only when useful or requested. Reopen only the changed assumption.
+- **Delivery:** implement a coherent scope, with one owner per path and focused checks while coding.
+  Review material risks when useful; after repair, recheck the affected findings. Root integrates,
+  verifies, and lands the authorized result, then releases the lanes. Unmet acceptance stays open.
+
 ## Dispatch
 
 Give the child this compact packet, omitting fields that do not apply:

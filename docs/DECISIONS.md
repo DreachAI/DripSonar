@@ -16,6 +16,13 @@ and [Claude Code subagent docs](https://code.claude.com/docs/en/sub-agents), che
 Local definition checks do not establish runtime discovery or model access. No global client
 settings, permission bypasses, API credentials, or automatic agent jobs are introduced.
 
+Follow-up source verification: GitHub identifies the Drip repository as `DripYCx26/dreach`;
+its remote HEAD on 2026-10-22 matches `f0ac4595ca65be72252e7e219aeb2cec8d257d48`.
+Read its `.agents/shared.md`, role prompts, and `dreach-research`, `dreach-design`, and
+`dreach-delivery` workflow skills directly. Adapt their evidence stopping rule, deletion/reuse
+questions, scope-and-acceptance handoff, actionable complexity review, and narrow repair rechecks.
+Keep DripSonar's shared prompt references instead of importing Dreach's generator and model ladder.
+
 ## 2026-10-22 — purpose and first user flow
 
 The owner selected company research and specific business signals as the first use case.

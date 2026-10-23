@@ -9,6 +9,7 @@ pub mod egress;
 pub mod export;
 pub mod extract;
 pub mod jobs;
+pub mod mcp;
 pub mod net;
 pub mod page;
 pub mod scrape;
@@ -64,6 +65,7 @@ pub(crate) mod testkit {
             browser_recycle_pages: 200,
             browser_sessions: 2,
             forward_proxy_port: 3003,
+            mcp_max_chars: 40_000,
         };
         let loopback = "127.0.0.1".parse().unwrap();
         let private = "10.0.0.1".parse().unwrap();

@@ -123,6 +123,9 @@ pub struct Config {
     /// Fixed loopback port of the browser forward proxy when Chrome is external.
     #[arg(long, env = "SONAR_FORWARD_PROXY_PORT", default_value_t = 3003, value_parser = clap::value_parser!(u16).range(1..))]
     pub forward_proxy_port: u16,
+    /// Characters per MCP tool result; longer text is cut with a note.
+    #[arg(long, env = "SONAR_MCP_MAX_CHARS", default_value_t = 40_000, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1000..))]
+    pub mcp_max_chars: usize,
 }
 
 fn at_least_one() -> clap::builder::RangedU64ValueParser<usize> {
@@ -170,6 +173,7 @@ impl fmt::Debug for Config {
             .field("browser_recycle_pages", &self.browser_recycle_pages)
             .field("browser_sessions", &self.browser_sessions)
             .field("forward_proxy_port", &self.forward_proxy_port)
+            .field("mcp_max_chars", &self.mcp_max_chars)
             .finish()
     }
 }

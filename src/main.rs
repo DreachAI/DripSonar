@@ -1,4 +1,4 @@
-//! `sonar` command line: serve, scrape, search, export.
+//! `sonar` command line: serve, mcp, scrape, search, export.
 
 use std::{error::Error, io::IsTerminal, process::ExitCode, sync::Arc, time::Duration};
 
@@ -7,6 +7,7 @@ use dripsonar::{
     api,
     browser::BrowserTier,
     config::Config,
+    jobs::JobError,
     net::Fetcher,
     page::RenderOptions,
     scrape::{self, ScrapeRequest, Scraper},
@@ -28,6 +29,8 @@ struct Cli {
 enum Command {
     /// Run the HTTP server.
     Serve,
+    /// Serve MCP tools on stdin/stdout for a local agent; logs go to stderr.
+    Mcp,
     /// Scrape one URL and print its markdown.
     Scrape { url: String },
     /// Search the web and print the hits.
@@ -117,12 +120,39 @@ async fn serve_until_signal(cfg: &Config, mut state: api::AppState) -> Result<()
     Ok(result?)
 }
 
+/// MCP over stdio until the client hangs up or a signal arrives. Crawl tools need the job
+/// lock; while `sonar serve` holds it on the same data directory, they report unavailable.
+async fn mcp(cfg: &Config, fetcher: Fetcher) -> Result<(), Box<dyn Error>> {
+    let mut state = api::AppState::new(cfg, fetcher.clone())?
+        .start_browser(cfg, &fetcher)
+        .await?;
+    let dispatcher = match state.start_jobs().await {
+        Ok(dispatcher) => Some(dispatcher),
+        Err(JobError::Locked) => {
+            tracing::warn!("data directory is in use by another server; crawl tools disabled");
+            None
+        }
+        Err(error) => return Err(error.into()),
+    };
+    let served = tokio::select! {
+        result = dripsonar::mcp::serve_stdio(state.clone(), cfg) => result,
+        () = shutdown_signal() => Ok(()),
+    };
+    state.stop_jobs();
+    if let Some(dispatcher) = dispatcher {
+        dispatcher.await?;
+    }
+    state.browser().shutdown().await;
+    served
+}
+
 async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     let cfg = cli.config;
     scrape::configure_rendering(cfg.render_threads);
     match cli.command {
         Command::ExtractPdf => dripsonar::document::extract_pdf_stdio()?,
         Command::Serve => serve(&cfg, Fetcher::new(&cfg)?).await?,
+        Command::Mcp => mcp(&cfg, Fetcher::new(&cfg)?).await?,
         Command::Scrape { url } => {
             let (fetcher, store) = (Fetcher::new(&cfg)?, Store::open(&cfg.data_dir)?);
             let browser = BrowserTier::start(&cfg, &fetcher, store.clone()).await?;

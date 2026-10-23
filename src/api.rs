@@ -10,8 +10,10 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use axum::{
     Extension, Json, Router,
-    extract::{DefaultBodyLimit, MatchedPath, Request, State, rejection::BytesRejection},
-    http::{HeaderValue, StatusCode, header},
+    extract::{
+        DefaultBodyLimit, MatchedPath, Path, Query, Request, State, rejection::BytesRejection,
+    },
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -35,7 +37,7 @@ use crate::{
     store::{Store, StoreError},
 };
 
-const BODY_LIMIT: usize = 1 << 20;
+pub(crate) const BODY_LIMIT: usize = 1 << 20;
 const SCRAPE_TIMEOUT_MS: u64 = scrape::DEFAULT_TIMEOUT.as_millis() as u64;
 /// Firecrawl's default search timeout.
 const SEARCH_TIMEOUT_MS: u64 = 60_000;
@@ -345,6 +347,10 @@ pub fn router(state: AppState) -> Router {
             "/v1/browser/{id}",
             post(browser::step).delete(browser::close),
         )
+        .route_service(
+            "/mcp",
+            crate::mcp::service(state.clone(), &state.job_config),
+        )
         .merge(jobs::routes())
         .merge(v2::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
@@ -551,18 +557,102 @@ impl IntoResponse for ApiError {
 type Reply = Result<Json<Value>, ApiError>;
 
 async fn scrape(State(state): State<AppState>, body: Result<Bytes, BytesRejection>) -> Reply {
-    let opts: ScrapeOptions = parse(body)?;
-    if opts.url.is_none() {
-        return Err(ApiError::bad_request("missing field `url`"));
-    }
-    let (request, formats) = state.plan(&opts, &[Format::Markdown])?;
-    let plan = browser_plan(&opts, &formats)?;
-    state.ensure_storage().await?;
-    let doc = state.scraper.scrape_with(&request, &plan).await?;
-    let data = state
-        .extracted_document(&doc, &formats, &request.url, &opts, request.deadline)
-        .await?;
+    let (_, data) = state.scrape_one(parse(body)?).await?;
     Ok(Json(json!({"success": true, "data": data})))
+}
+
+impl AppState {
+    /// One v1 scrape: the document and its Firecrawl `data`.
+    async fn scrape_one(
+        &self,
+        opts: ScrapeOptions,
+    ) -> Result<(Document, Map<String, Value>), ApiError> {
+        if opts.url.is_none() {
+            return Err(ApiError::bad_request("missing field `url`"));
+        }
+        let (request, formats) = self.plan(&opts, &[Format::Markdown])?;
+        let plan = browser_plan(&opts, &formats)?;
+        self.ensure_storage().await?;
+        let doc = self.scraper.scrape_with(&request, &plan).await?;
+        let data = self
+            .extracted_document(&doc, &formats, &request.url, &opts, request.deadline)
+            .await?;
+        Ok((doc, data))
+    }
+
+    /// Runs one MCP tool operation through its route's own validation and collection,
+    /// in process. Bodies use the Firecrawl v1 wire shapes.
+    pub(crate) async fn call(&self, call: Call) -> Result<Value, CallError> {
+        let body = |value: Value| Ok(Bytes::from(value.to_string()));
+        let state = || State(self.clone());
+        // Job routes build response URLs from Host; MCP replies drop them.
+        let mut host = HeaderMap::new();
+        if let Ok(value) = HeaderValue::from_str(&self.job_config.bind.to_string()) {
+            host.insert(header::HOST, value);
+        }
+        let reply = match call {
+            Call::Scrape(value) => {
+                let (doc, mut data) = self.scrape_one(parse(body(value))?).await?;
+                if let (Some(id), Some(Value::Object(meta))) =
+                    (doc.capture_id, data.get_mut("metadata"))
+                {
+                    meta.insert("captureId".into(), json!(id));
+                }
+                Ok(Json(json!({"success": true, "data": data})))
+            }
+            Call::Search(value) => search(state(), body(value)).await,
+            Call::Map(value) => jobs::map(state(), body(value)).await,
+            Call::CrawlStart(value) => jobs::crawl_start(state(), host, body(value)).await,
+            Call::CrawlStatus { id, skip, limit } => {
+                let page = jobs::Pagination {
+                    skip: Some(skip),
+                    limit: Some(limit),
+                };
+                jobs::crawl_status(state(), host, Path(id), Query(page)).await
+            }
+            Call::CrawlCancel(id) => {
+                return match jobs::crawl_cancel(state(), Path(id)).await? {
+                    reply if reply.status() == StatusCode::CONFLICT => Err(CallError {
+                        code: "CONFLICT",
+                        message: "Crawl is already completed".into(),
+                    }),
+                    _ => Ok(json!({"status": "cancelled"})),
+                };
+            }
+            Call::BrowserOpen(value) => browser::open(state(), body(value)).await,
+            Call::BrowserStep(id, value) => browser::step(state(), Path(id), body(value)).await,
+            Call::BrowserClose(id) => browser::close(state(), Path(id)).await,
+        };
+        Ok(reply?.0)
+    }
+}
+
+/// One in-process operation behind an MCP tool.
+pub(crate) enum Call {
+    Scrape(Value),
+    Search(Value),
+    Map(Value),
+    CrawlStart(Value),
+    CrawlStatus { id: String, skip: u64, limit: usize },
+    CrawlCancel(String),
+    BrowserOpen(Value),
+    BrowserStep(String, Value),
+    BrowserClose(String),
+}
+
+/// A failed call: the Firecrawl error code and its reason.
+pub(crate) struct CallError {
+    pub code: &'static str,
+    pub message: String,
+}
+
+impl From<ApiError> for CallError {
+    fn from(error: ApiError) -> Self {
+        Self {
+            code: error.code,
+            message: error.message,
+        }
+    }
 }
 
 async fn search(State(state): State<AppState>, body: Result<Bytes, BytesRejection>) -> Reply {

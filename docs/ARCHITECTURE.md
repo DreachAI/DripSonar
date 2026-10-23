@@ -39,7 +39,8 @@ One Cargo package, `dripsonar`: a library plus the `sonar` binary (`serve`, `scr
 | `scrape` | One scrape: cache, single-flight, fetch, classify, render | `Scraper::scrape(&ScrapeRequest) -> Result<Document, ScrapeError>` | net, page, store |
 | `search` | Search providers and optional per-result scraping | `Searcher::search(&SearchRequest) -> Result<Vec<Hit>, SearchError>` | net, scrape |
 | `api` | HTTP routes, both wire shapes, validation, auth, error mapping | `router(AppState) -> axum::Router` | scrape, search |
-| `main` | CLI and server lifecycle | — | api, config |
+| `mcp` | MCP tools over stdio and `/mcp`, through the API's in-process calls | `service`, `serve_stdio` | api, config (`api::router` mounts it: the one back edge) |
+| `main` | CLI and server lifecycle | — | api, mcp, config |
 
 Dependencies are acyclic in that order. `page` never touches the network or disk. Page collection
 uses `net::fetch` and its destination guard; structured extraction uses a separate operator-trusted
@@ -406,5 +407,25 @@ minutes (never below configured spacing); successful 2xx responses halve it towa
   `previousScrapeAt` is the baseline capture time (null for new), visibility is `visible`, and
   requested git diffs use `similar`'s unified line diff on bounded rendering workers. Damaged
   history fails instead of inventing a new page. Jobs persist comparison results with documents.
+
+### MCP server (`mcp`)
+
+- As built: crate `rmcp` pinned at 3.7.0 (official Rust SDK; tool macros and `schemars` input
+  schemas). Tools: `search`, `scrape`, `extract`, `map`, `crawl_start`, `crawl_status`,
+  `crawl_cancel`, `browser_open`, `browser_step`, `browser_close`.
+- Each tool builds a Firecrawl v1 body and runs `AppState::call`, which invokes the matching
+  route handler in process (no HTTP to self), so validation, limits, error codes, storage
+  floors, and the browser and job owners are shared with the HTTP API. Scrape replies add the
+  capture ID. Replies are reshaped for agents (text as `content`, provenance fields, a notice
+  that page text is untrusted data) and returned as JSON text plus identical structured content.
+- Results are bounded by `SONAR_MCP_MAX_CHARS` (default 40000): the longest strings are cut to a
+  common length first (never below 200 characters) and, when that cannot fit, the longest lists
+  are halved; a `truncated` note says so. Failures are tool errors `CODE: reason`, never empty
+  successes; invalid arguments are refused by name.
+- `/mcp` sits behind the same bearer check as the API. It is stateless with JSON replies (no
+  sessions or server-initiated streams, so `GET` is 405), bodies are capped at 1 MiB, and without
+  an API key the `Host` header must be loopback, the bind address, or `SONAR_PUBLIC_URL`'s host
+  (DNS rebinding guard). `sonar mcp` serves stdio with logs on stderr; when another process holds
+  the data directory's job lock, its crawl tools report `SERVICE_UNAVAILABLE`.
 
 The company-signal layers remain later work in [BUILDOUT.md](BUILDOUT.md).

@@ -37,7 +37,44 @@ search backend. EC2 deployment: [deploy/README.md](deploy/README.md) and [script
 | Firecrawl v2 | the same under `/v2` |
 | context.dev | `/v1/web/scrape`, `/v1/web/search` |
 | Browser sessions | `POST /v1/browser`, `POST`/`DELETE /v1/browser/:id`; screenshots at `/v1/artifacts/:id` |
+| MCP (agent tools) | `POST /mcp` (Streamable HTTP, stateless; `GET` answers 405); `sonar mcp` serves the same tools on stdio |
 | Health | `GET /health` |
+
+## Use from agents
+
+The MCP server gives agents the tools `search`, `scrape`, `extract`, `map`, `crawl_start`,
+`crawl_status`, `crawl_cancel`, `browser_open`, `browser_step`, and `browser_close`. Results are
+capped at `SONAR_MCP_MAX_CHARS` (default 40000) with a note when cut.
+
+Claude Code (add `--header "Authorization: Bearer $SONAR_API_KEY"` when a key is set):
+
+```bash
+claude mcp add --transport http dripsonar http://127.0.0.1:3002/mcp
+claude mcp add dripsonar-local -- sonar mcp    # stdio, no server needed
+```
+
+OpenCode (`opencode.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "dripsonar": {
+      "type": "remote",
+      "url": "http://127.0.0.1:3002/mcp",
+      "headers": { "Authorization": "Bearer {env:SONAR_API_KEY}" }
+    },
+    "dripsonar-local": {
+      "type": "local",
+      "command": ["sonar", "mcp"],
+      "environment": { "SONAR_DATA_DIR": "/path/to/data" }
+    }
+  }
+}
+```
+
+Drop `headers` when no key is set. A stdio server sharing a data directory with a running
+`sonar serve` works, but its crawl tools report unavailable (the server owns the job lock).
 
 ## Repository map
 

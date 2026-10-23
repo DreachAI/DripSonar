@@ -323,8 +323,8 @@ pub(super) async fn batch_start(
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct Pagination {
-    skip: Option<u64>,
-    limit: Option<usize>,
+    pub(super) skip: Option<u64>,
+    pub(super) limit: Option<usize>,
 }
 
 pub(super) async fn crawl_active(State(state): State<AppState>) -> Reply {

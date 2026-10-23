@@ -284,9 +284,19 @@ type leaves `browser`.
 
 ### v2 routes
 
-- `/v2/scrape`, `/v2/search`, `/v2/map`, `/v2/crawl[/:id]`, `/v2/batch/scrape[/:id]` share the same
-  internals. Formats accept strings or `{type}` objects; `maxAge` has no default; `sitemap`
-  `skip|include|only` replaces `ignoreSitemap`/`sitemapOnly`; `maxDiscoveryDepth` replaces `maxDepth`.
+- As built: `/v2/scrape`, `/v2/search`, `/v2/map`, `/v2/crawl[/:id]`, and
+  `/v2/batch/scrape[/:id]`, including job DELETE and `/errors`, reuse v1 collection and job owners.
+  Status and submission URLs stay on v2. Search returns `data.web`; map returns `links: [{url}]`.
+- Formats accept strings or strict `{type}` objects: markdown, html, rawHtml, links, screenshot.
+  Screenshot `fullPage` and JPEG `quality` map to the browser; `viewport` is rejected (fixed viewport).
+  `parsers: ["pdf"]` or `[{type:"pdf"}]` enables PDF parsing; `[]` disables it. Absent `maxAge`
+  uses server configuration. `sitemap: skip|include|only` maps to shared discovery, with `only`
+  disabling page-link discovery; crawl uses `maxDiscoveryDepth`, `crawlEntireDomain`, `allowSubdomains`.
+- Search defaults to 10 hits, accepts only web sources (string or `{type:"web"}`), and applies
+  includeDomains or excludeDomains to returned hosts/subdomains before optional scraping; no refill.
+  `tbs`, `location`, source options, and other unsupported fields/formats/parsers get named 400s.
+  Shared v1 no-ops remain no-ops. Jobs reject screenshots, nonempty actions, and positive waitFor
+  because workers do not execute browser plans. Legacy v1-only option names are rejected.
 
 ### Later
 

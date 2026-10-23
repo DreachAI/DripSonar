@@ -4,6 +4,7 @@
 
 mod browser;
 mod jobs;
+mod v2;
 
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
@@ -173,6 +174,7 @@ pub fn router(state: AppState) -> Router {
             post(browser::step).delete(browser::close),
         )
         .merge(jobs::routes())
+        .merge(v2::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
         .route("/health", get(|| async { "ok" }))

@@ -99,7 +99,7 @@ fn public_url(state: &AppState, headers: &HeaderMap, path: &str) -> Result<Strin
     Ok(format!("{}{path}", base.as_str().trim_end_matches('/')))
 }
 
-async fn map(
+pub(super) async fn map(
     State(state): State<AppState>,
     body: Result<Bytes, BytesRejection>,
 ) -> Result<Json<Value>, ApiError> {
@@ -155,7 +155,7 @@ struct CrawlBody {
     _integration: Option<String>,
 }
 
-async fn crawl_start(
+pub(super) async fn crawl_start(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
@@ -242,7 +242,7 @@ fn take<T: DeserializeOwned>(
         .map_err(|e| ApiError::bad_request(format!("{name}: {e}")))
 }
 
-async fn batch_start(
+pub(super) async fn batch_start(
     State(state): State<AppState>,
     headers: HeaderMap,
     body: Result<Bytes, BytesRejection>,
@@ -305,7 +305,7 @@ async fn batch_start(
 
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Pagination {
+pub(super) struct Pagination {
     skip: Option<u64>,
     limit: Option<usize>,
 }
@@ -369,7 +369,7 @@ async fn status(
     Ok(Json(result))
 }
 
-async fn crawl_status(
+pub(super) async fn crawl_status(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
@@ -377,7 +377,7 @@ async fn crawl_status(
 ) -> Result<Json<Value>, ApiError> {
     status(state, headers, id, query, JobKind::Crawl).await
 }
-async fn batch_status(
+pub(super) async fn batch_status(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(id): Path<String>,
@@ -396,13 +396,13 @@ async fn cancel(state: AppState, raw_id: String, kind: JobKind) -> Result<Respon
         Some(true) => Ok(Json(json!({"status":"cancelled"})).into_response()),
     }
 }
-async fn crawl_cancel(
+pub(super) async fn crawl_cancel(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
     cancel(state, id, JobKind::Crawl).await
 }
-async fn batch_cancel(
+pub(super) async fn batch_cancel(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Response, ApiError> {
@@ -424,14 +424,14 @@ async fn errors(state: AppState, raw_id: String, kind: JobKind) -> Result<Json<V
     Ok(Json(json!({"errors":errors,"robotsBlocked":[]})))
 }
 
-async fn crawl_errors(
+pub(super) async fn crawl_errors(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
     errors(state, id, JobKind::Crawl).await
 }
 
-async fn batch_errors(
+pub(super) async fn batch_errors(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {

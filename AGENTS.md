@@ -52,13 +52,10 @@ Remote: `DreachAI/DripSonar` (private). Current scope and proof live in `docs/BU
 
 ## Verification and delivery
 
-- Run focused checks for the behavior touched; broaden only for a concrete dependency or failure.
-  Test observable outcomes and negative paths, not a mirror of the implementation.
-- Never invent successful checks, metrics, jobs, or readiness. Distinguish inspected, implemented,
-  tested, deployed, and proven behavior. State limitations and checks not run.
-- During bootstrap, use `git diff --check` and verify the reference pin with `git submodule status`.
-  There is no Cargo workspace, application, or CI gate yet. Add real Rust checks with the first
-  executable slice; never report documentation checks as a working crawler.
+- Current owner policy (build-out phase): no new tests, no CI, no pull requests or branch rules.
+  Commit and push straight to the single `main` branch. Code must still compile (`cargo build`).
+- Never invent successful checks, metrics, jobs, or readiness. Distinguish implemented, compiled,
+  deployed, and proven behavior; say plainly what has not been run.
 - Keep expensive builds, browser fleets, and benchmarks on an appropriate runner. Use lightweight
   local checks for local changes, and report exactly where a live verification ran.
 - Report the result, relevant evidence, and remaining blockers briefly.

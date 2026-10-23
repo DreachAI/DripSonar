@@ -1,9 +1,18 @@
 //! `sonar` command line: serve, scrape, search.
 
-use std::process::ExitCode;
+use std::{error::Error, io::IsTerminal, process::ExitCode, sync::Arc, time::Duration};
 
 use clap::{Parser, Subcommand};
-use dripsonar::{api, config::Config};
+use dripsonar::{
+    api,
+    config::Config,
+    net::Fetcher,
+    page::RenderOptions,
+    scrape::{self, ScrapeRequest, Scraper},
+    search::Searcher,
+    store::Store,
+};
+use tokio::time::Instant;
 
 #[derive(Parser)]
 #[command(version, about)]
@@ -41,24 +50,75 @@ async fn shutdown_signal() {
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
-    match cli.command {
-        Command::Serve => {
-            let listener = tokio::net::TcpListener::bind(cli.config.bind).await?;
-            tracing::info!(bind = %cli.config.bind, "serving");
-            axum::serve(listener, api::router(api::AppState))
-                .with_graceful_shutdown(shutdown_signal())
-                .await?;
+/// Stops accepting on a signal, then gives in-flight requests up to the longest request
+/// timeout to finish.
+async fn serve(cfg: &Config, fetcher: Fetcher) -> Result<(), Box<dyn Error>> {
+    let state = api::AppState::new(cfg, fetcher)?;
+    let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
+    tracing::info!(bind = %cfg.bind, "serving");
+    let stop = Arc::new(tokio::sync::Notify::new());
+    let stopped = Arc::clone(&stop);
+    let server = axum::serve(listener, api::router(state))
+        .with_graceful_shutdown(async move { stopped.notified().await });
+    let mut server = std::pin::pin!(server.into_future());
+    tokio::select! {
+        result = &mut server => return Ok(result?),
+        () = shutdown_signal() => {}
+    }
+    tracing::info!("draining in-flight requests");
+    stop.notify_one();
+    let grace = Duration::from_millis(cfg.max_timeout_ms);
+    match tokio::time::timeout(grace, server).await {
+        Ok(result) => Ok(result?),
+        Err(_) => {
+            tracing::warn!("grace period elapsed; dropping remaining requests");
             Ok(())
         }
-        Command::Scrape { .. } | Command::Search { .. } => Err("not implemented yet".into()),
     }
+}
+
+async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
+    let cfg = cli.config;
+    let fetcher = Fetcher::new(&cfg)?;
+    match cli.command {
+        Command::Serve => serve(&cfg, fetcher).await?,
+        Command::Scrape { url } => {
+            let scraper = Scraper::new(fetcher, Store::open(&cfg.data_dir)?, &cfg);
+            let request = ScrapeRequest {
+                url,
+                headers: Vec::new(),
+                deadline: Instant::now() + scrape::DEFAULT_TIMEOUT,
+                max_age: Duration::from_millis(cfg.default_max_age_ms),
+                render: RenderOptions {
+                    only_main_content: true,
+                    remove_base64_images: true,
+                    markdown: true,
+                    ..RenderOptions::default()
+                },
+                raw_html: false,
+            };
+            let doc = scraper.scrape(&request).await?;
+            println!("{}", doc.rendered.markdown.unwrap_or_default());
+        }
+        Command::Search { query } => {
+            let deadline = Instant::now() + Duration::from_secs(60);
+            let hits = Searcher::new(fetcher, &cfg)
+                .search(&query, 5, "en", deadline)
+                .await?;
+            println!("{}", serde_json::to_string_pretty(&hits)?);
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
 async fn main() -> ExitCode {
     tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .with_ansi(std::io::stdout().is_terminal())
         .init();
     match run(Cli::parse()).await {
         Ok(()) => ExitCode::SUCCESS,

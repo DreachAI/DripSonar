@@ -146,7 +146,7 @@ for blocks, otherwise the Firecrawl code) with `error`.
   queries, or credentials.
 - Graceful shutdown stops accepting requests and lets in-flight requests finish within a bound.
 
-## Stage-1 tests (written first, kept few)
+## Stage-1 tests (written before the no-tests policy; kept, not a gate)
 
 | Test | Proves |
 | --- | --- |
@@ -158,19 +158,80 @@ for blocks, otherwise the Firecrawl code) with `error`.
 | `cache_and_single_flight` | A cached hit avoids a refetch; `maxAge:0` refetches; concurrent misses fetch once |
 
 Tests use a local HTTP server and an injected resolver through a test-only constructor that is not
-compiled into the release binary. `tools/ci` runs `cargo fmt --check`, `cargo clippy --all-targets
---locked -- -D warnings`, and `cargo test --locked`. The live check runs `sonar serve` and points
-`drip-training`'s firecrawl backend at it for a handful of real `read_page` and `web_search` calls.
+compiled into the release binary. There is no CI gate during the build-out (DECISIONS.md). The live
+check, when the owner runs it, points `drip-training`'s firecrawl backend at `sonar serve`.
 
-## Next slices
+## Build-out slices
 
-1. **Crawl and map (durable jobs):** `POST /v1/map`, `POST /v1/crawl`, `GET`/`DELETE /v1/crawl/:id`.
-   A `jobs` table and a `frontier` table in the same SQLite file; workers lease frontier rows with a
-   generation token, so a restart resumes and stale workers cannot commit. Sitemaps, scope rules,
-   depth and page limits, per-host interleaving, and cancellation.
-2. **Browser tier:** a separately supervised headless browser used only when a page is a script
-   shell, with all its traffic forced through the same guard.
-3. **Proxy route:** per-host permission, route recorded on every capture, spend caps; tunnels must
-   connect to the locally validated address or the provider is refused.
-4. **Documents:** PDF text extraction behind the same `page` interface.
-5. **v2 routes**, then the company-signal layers in [BUILDOUT.md](BUILDOUT.md).
+Choices below were weighed on 2026-10-22 from crate metadata and reference source; see
+DECISIONS.md. Each slice is a module with one owner; `api` gains routes, `scrape` gains tiers.
+
+### Crawl, map, and batch scrape (`jobs`, `crawl`, `sitemap`)
+
+- Routes: `POST /v1/map`, `POST /v1/crawl`, `GET`/`DELETE /v1/crawl/:id`, `POST /v1/batch/scrape`,
+  `GET`/`DELETE /v1/batch/scrape/:id`, with Firecrawl v1 fields and defaults (crawl `limit` 10000,
+  `maxDepth` 10, `includePaths`/`excludePaths` regexes, `allowBackwardLinks`/`crawlEntireDomain`,
+  `allowExternalLinks`, `allowSubdomains`, `ignoreSitemap`, `ignoreQueryParameters`, `delay`,
+  `scrapeOptions`; map `limit` 5000, `search`, `includeSubdomains`, `sitemapOnly`, `ignoreSitemap`).
+- `jobs` owns three tables in `sonar.db`: `jobs` (id, kind, request JSON, status
+  queued/scraping/completed/failed/cancelled, counters, created/updated/expires), `frontier`
+  (job, normalized URL unique per job, depth, state queued/leased/done/failed/skipped, lease owner,
+  lease generation, lease expiry, attempts), and `results` (job, URL, document JSON, error code).
+- Workers lease frontier rows in one transaction (`UPDATE … RETURNING`), bumping the generation;
+  completion commits only when the generation still matches. Expired leases return to `queued`, so a
+  restart or a stuck worker never loses or duplicates a result. Cancellation flips the job and stops
+  new leases; in-flight pages finish or time out.
+- Scheduling interleaves hosts: a worker pool (size from config) takes the oldest queued row whose
+  host is not at its per-host limit. The `net` per-host gate still applies.
+- Discovery: links from each rendered page plus `sitemap.xml` (and sitemap indexes, gzip) parsed
+  with `quick-xml` and `flate2` under byte, entry, and depth caps. Every discovered URL is normalized
+  (lowercase scheme and host, drop fragment and default port, optionally drop the query) and passes
+  the scope rules before insertion; inserts are `INSERT OR IGNORE`, so duplicates cost nothing.
+- Map runs sitemap plus one page of links (no full crawl), filters by `search` substring, and caps.
+- Status pages results with `next` (offset cursor) and reports `completed`, `total`, `creditsUsed: 0`,
+  `expiresAt` (24 h retention, then a sweeper deletes job rows).
+
+### Browser tier (`browser`)
+
+- Crate: `chromiumoxide` (async tokio, full DevTools protocol). One Chrome process, a semaphore of
+  N tabs (default 4), a per-page timeout, restart every 200 pages or on any handler error, child
+  killed on drop, a fresh `--user-data-dir` per launch. Disabled unless `SONAR_CHROME_PATH` is set.
+- Escalation: plain HTTP first. The browser runs only when the request asks (`waitFor` > 0 or
+  `actions`), or when the plain response is HTML whose rendered text is tiny but whose body carries
+  script-shell markers (a root `div` with no text, `__NEXT_DATA__` without content, `noscript`
+  warnings). Never on a block or challenge.
+- Guard: Chrome is launched with `--proxy-server=http://127.0.0.1:<port>` and
+  `--proxy-bypass-list=<-loopback>`, pointing at an in-process forward proxy (`egress`) that resolves,
+  checks, and dials the checked address (directly or through the SOCKS5 route), and refuses
+  everything else. WebRTC non-proxied UDP is disabled. The rendered HTML goes through `page` as usual.
+
+### Egress and proxy route (`egress`)
+
+- Upstream residential proxy: `SONAR_PROXY=socks5://user:pass@host:port`, only `socks5://` (local
+  DNS through our guarded resolver, IP-literal CONNECT, TLS verified against the original host).
+  `socks5h://` and `http(s)://` proxies are refused at startup: they let the proxy resolve names.
+- Route per destination host from `SONAR_PROXY_HOSTS` (comma-separated suffixes, or `*`); default
+  is direct. Every capture records `proxyUsed: "basic"` (direct) or `"stealth"` (proxied) and the
+  bytes moved; `SONAR_PROXY_MAX_BYTES_PER_DAY` stops proxied fetches when spent.
+- `egress` also hosts the local forward proxy used by the browser (HTTP `CONNECT` and absolute-URI
+  requests), bound to loopback with a random port and a per-launch token in the proxy credentials.
+
+### Documents (`document`)
+
+- Crate: `pdf_oxide` (MIT/Apache, pure Rust, markdown output). Extraction runs in a child process,
+  `sonar extract-pdf`, fed bytes on stdin and killed after a timeout (default 30 s), with page and
+  output caps; a panic or hang in a parser cannot take down the server. A PDF with almost no text
+  per page returns `SCRAPE_PDF_OCR_REQUIRED`; encrypted PDFs return `SCRAPE_UNSUPPORTED_FILE_ERROR`.
+- Metadata from the PDF info dictionary maps to `title`, `numPages`; dates only as stated.
+
+### v2 routes
+
+- `/v2/scrape`, `/v2/search`, `/v2/map`, `/v2/crawl[/:id]`, `/v2/batch/scrape[/:id]` share the same
+  internals. Formats accept strings or `{type}` objects; `maxAge` has no default; `sitemap`
+  `skip|include|only` replaces `ignoreSitemap`/`sitemapOnly`; `maxDiscoveryDepth` replaces `maxDepth`.
+
+### Later
+
+LLM `json`/`extract` formats through an OpenAI-compatible endpoint with a spend cap; screenshots
+from the browser tier; change tracking from stored captures; then the company-signal layers in
+[BUILDOUT.md](BUILDOUT.md).

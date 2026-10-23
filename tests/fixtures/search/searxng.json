@@ -1,0 +1,9 @@
+{
+  "fixture": "SYNTHETIC search results; not a captured provider response",
+  "results": [
+    {"url": "https://example.com/story/#section", "title": "  Example\n company  ", "content": " A\tnew  office "},
+    {"url": "https://example.com/story", "title": "Duplicate", "content": "Lower ranked"},
+    {"url": "javascript:alert(1)", "title": "Not a web result"},
+    {"url": "https://example.org/next", "title": "Next", "content": "Second result"}
+  ]
+}

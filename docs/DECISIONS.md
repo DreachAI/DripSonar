@@ -1,5 +1,32 @@
 # Decisions
 
+## 2026-10-22 — build-out policy: all Rust, no tests or CI, push to main
+
+The owner wants DripSonar fully in Rust, deployed as one binary on an EC2 host and run at high
+throughput. For the build-out phase: no new tests, no CI, no pull requests or branch protection;
+commit and push directly to the single `main` branch. Code still has to compile. The small tests
+written before this decision stay but are not a gate. Headless Chrome (driven from Rust) remains
+the only non-Rust runtime, for script-rendered pages; SearXNG stays an optional external endpoint.
+This supersedes the `tools/ci` gate and stage-1 test list in ARCHITECTURE.md and the CI rule in
+CODE_STYLE.md while the policy holds.
+
+Build-out choices weighed the same day (crate metadata from crates.io, reqwest 0.12.28 and
+hyper-util source, the pinned Spider checkout):
+
+- Browser: `chromiumoxide` (async tokio, full DevTools protocol, most used). Rejected:
+  `headless_chrome` (synchronous), `fantoccini`/`thirtyfour` (WebDriver cannot see subresources),
+  the `chromey` fork (unneeded). All browser traffic goes through an in-process guarded forward proxy,
+  because Chrome resolves DNS itself and a URL check alone leaves a rebinding window.
+- PDF: `pdf_oxide` (pure Rust, MIT/Apache, markdown output; its benchmarks are the author's claims)
+  in a killable child process. Fallback `pdf-extract` (documented panics). Rejected: `mupdf` (AGPL),
+  `pdfium-render` (native library to ship; first upgrade if quality falls short).
+- Residential proxy: SOCKS5 with local DNS only. reqwest passes our guarded resolver to SOCKS5 and
+  sends an IP-literal CONNECT, then verifies TLS against the original host. HTTP-CONNECT proxies send
+  the hostname and let the provider resolve it, so they are refused until a custom tunnel exists.
+  Provider support for IP-literal SOCKS5 is unverified.
+- Sitemaps on `quick-xml` + `flate2` (sitemap crates are stale); URL normalization on `url` plus a
+  few rules; `texting_robots` later if robots.txt is re-enabled.
+
 ## 2026-10-22 — first deliverable: durable Firecrawl replacement for AI tools
 
 The owner redirected the first deliverable to a durable Rust port of Firecrawl, with upgrades,

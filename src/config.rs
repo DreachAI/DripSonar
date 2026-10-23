@@ -18,18 +18,25 @@ pub struct Config {
     pub user_agent: String,
     #[arg(long, env = "SEARXNG_ENDPOINT")]
     pub searxng_endpoint: Option<url::Url>,
-    #[arg(long, default_value_t = 10_485_760)]
+    /// Ports allowed besides 80 and 443.
+    #[arg(long, env = "SONAR_EXTRA_PORTS", value_delimiter = ',')]
+    pub extra_ports: Vec<u16>,
+    #[arg(long, default_value_t = 10_485_760, value_parser = at_least_one())]
     pub max_body_bytes: usize,
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 32, value_parser = at_least_one())]
     pub global_concurrency: usize,
-    #[arg(long, default_value_t = 2)]
+    #[arg(long, default_value_t = 2, value_parser = at_least_one())]
     pub per_host_concurrency: usize,
     #[arg(long, default_value_t = 250)]
     pub per_host_spacing_ms: u64,
-    #[arg(long, default_value_t = 120_000)]
+    #[arg(long, default_value_t = 120_000, value_parser = clap::value_parser!(u64).range(1000..))]
     pub max_timeout_ms: u64,
     #[arg(long, default_value_t = 86_400_000)]
     pub default_max_age_ms: u64,
+}
+
+fn at_least_one() -> clap::builder::RangedU64ValueParser<usize> {
+    clap::builder::RangedU64ValueParser::new().range(1..)
 }
 
 impl fmt::Debug for Config {
@@ -40,6 +47,7 @@ impl fmt::Debug for Config {
             .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
             .field("user_agent", &self.user_agent)
             .field("searxng_endpoint", &self.searxng_endpoint)
+            .field("extra_ports", &self.extra_ports)
             .field("max_body_bytes", &self.max_body_bytes)
             .field("global_concurrency", &self.global_concurrency)
             .field("per_host_concurrency", &self.per_host_concurrency)

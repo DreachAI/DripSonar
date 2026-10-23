@@ -120,7 +120,48 @@ pub struct Store {
     artifacts: PathBuf,
 }
 
+pub struct Capture {
+    pub id: i64,
+    pub blob_sha256: String,
+    pub tier: Tier,
+    pub fetched: Fetched,
+}
+
 impl Store {
+    /// Runs job SQL on the existing writer; a failed closure rolls back the whole transaction.
+    pub async fn write<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, StoreError> + Send + 'static,
+    ) -> Result<T, StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || {
+            let mut writer = db.writer.lock().unwrap_or_else(PoisonError::into_inner);
+            let tx = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let result = f(&tx)?;
+            tx.commit()?;
+            Ok(result)
+        })
+        .await
+        .map_err(|_| StoreError::Task)?
+    }
+
+    pub async fn read<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
+    ) -> Result<T, StoreError> {
+        let db = Arc::clone(&self.db);
+        tokio::task::spawn_blocking(move || {
+            let conn = db.reader()?;
+            let result = f(&conn);
+            if result.is_ok() {
+                db.recycle(conn);
+            }
+            result
+        })
+        .await
+        .map_err(|_| StoreError::Task)?
+    }
+
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         let blobs = dir.join("blobs").join("sha256");
         fs::create_dir_all(&blobs)?;
@@ -134,6 +175,7 @@ impl Store {
         // NORMAL is crash-safe in WAL: a power loss can drop the newest rows, never corrupt.
         writer.pragma_update(None, "synchronous", "NORMAL")?;
         writer.pragma_update(None, "foreign_keys", true)?;
+        writer.pragma_update(None, "secure_delete", true)?;
         writer.execute_batch(SCHEMA)?;
         writer.execute_batch(ARTIFACTS_SCHEMA)?;
         // Serialize schema inspection and ALTER across simultaneous opens of an old store.
@@ -177,6 +219,17 @@ impl Store {
         key: &str,
         max_age: Duration,
     ) -> Result<Option<Fetched>, StoreError> {
+        Ok(self
+            .cached_capture(key, max_age)
+            .await?
+            .map(|capture| capture.fetched))
+    }
+
+    pub async fn cached_capture(
+        &self,
+        key: &str,
+        max_age: Duration,
+    ) -> Result<Option<Capture>, StoreError> {
         let (store, key) = (self.clone(), key.to_owned());
         tokio::task::spawn_blocking(move || store.cached_blocking(&key, max_age))
             .await
@@ -184,16 +237,16 @@ impl Store {
     }
 
     /// Appends a capture: blob file first (temp, fsync, rename), then its row.
-    pub async fn put(&self, key: &str, fetched: &Fetched) -> Result<(), StoreError> {
+    pub async fn put(&self, key: &str, fetched: &Fetched) -> Result<i64, StoreError> {
         self.put_tier(key, fetched, Tier::Http).await
     }
 
     /// Appends a browser capture; its body is the rendered DOM as UTF-8 HTML.
-    pub async fn put_rendered(&self, key: &str, fetched: &Fetched) -> Result<(), StoreError> {
+    pub async fn put_rendered(&self, key: &str, fetched: &Fetched) -> Result<i64, StoreError> {
         self.put_tier(key, fetched, Tier::Browser).await
     }
 
-    async fn put_tier(&self, key: &str, fetched: &Fetched, tier: Tier) -> Result<(), StoreError> {
+    async fn put_tier(&self, key: &str, fetched: &Fetched, tier: Tier) -> Result<i64, StoreError> {
         let (store, key, fetched) = (self.clone(), key.to_owned(), fetched.clone());
         tokio::task::spawn_blocking(move || store.put_blocking(&key, &fetched, tier))
             .await
@@ -233,7 +286,7 @@ impl Store {
             .map_err(|_| StoreError::Task)?
     }
 
-    fn cached_blocking(&self, key: &str, max_age: Duration) -> Result<Option<Fetched>, StoreError> {
+    fn cached_blocking(&self, key: &str, max_age: Duration) -> Result<Option<Capture>, StoreError> {
         let max_age_ms = i64::try_from(max_age.as_millis()).unwrap_or(i64::MAX);
         let since = unix_ms(OffsetDateTime::now_utc())?.saturating_sub(max_age_ms);
         let row = {
@@ -241,7 +294,7 @@ impl Store {
             let row = db
                 .query_row(
                     "SELECT requested_url, final_url, status, headers, content_type, blob_sha256,
-                        fetched_at_ms, route
+                        fetched_at_ms, route, id, tier
                  FROM captures
                  WHERE cache_key = ?1 AND fetched_at_ms >= ?2 AND status BETWEEN 200 AND 299
                  ORDER BY fetched_at_ms DESC, id DESC LIMIT 1",
@@ -256,6 +309,8 @@ impl Store {
                             row.get::<_, String>(5)?,
                             row.get::<_, i64>(6)?,
                             row.get::<_, Option<String>>(7)?,
+                            row.get::<_, i64>(8)?,
+                            row.get::<_, Option<String>>(9)?,
                         ))
                     },
                 )
@@ -266,8 +321,18 @@ impl Store {
             }
             row?
         };
-        let Some((requested, final_url, status, headers, content_type, hash, fetched_at, route)) =
-            row
+        let Some((
+            requested,
+            final_url,
+            status,
+            headers,
+            content_type,
+            hash,
+            fetched_at,
+            route,
+            id,
+            tier,
+        )) = row
         else {
             return Ok(None);
         };
@@ -276,26 +341,58 @@ impl Store {
             Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
             Err(e) => return Err(e.into()),
         };
-        Ok(Some(Fetched {
-            route: match route.as_deref() {
-                None | Some("direct") => Route::Direct,
-                Some("proxy") => Route::Proxy,
-                _ => return Err(StoreError::Corrupt),
+        Ok(Some(Capture {
+            id,
+            blob_sha256: hash,
+            tier: stored_tier(tier.as_deref())?,
+            fetched: Fetched {
+                route: match route.as_deref() {
+                    None | Some("direct") => Route::Direct,
+                    Some("proxy") => Route::Proxy,
+                    _ => return Err(StoreError::Corrupt),
+                },
+                requested_url: requested.parse().map_err(|_| StoreError::Corrupt)?,
+                final_url: final_url.parse().map_err(|_| StoreError::Corrupt)?,
+                status,
+                headers: serde_json::from_str(&headers).map_err(|_| StoreError::Corrupt)?,
+                content_type,
+                body: body.into(),
+                fetched_at: OffsetDateTime::from_unix_timestamp_nanos(
+                    i128::from(fetched_at) * 1_000_000,
+                )
+                .map_err(|_| StoreError::Corrupt)?,
             },
-            requested_url: requested.parse().map_err(|_| StoreError::Corrupt)?,
-            final_url: final_url.parse().map_err(|_| StoreError::Corrupt)?,
-            status,
-            headers: serde_json::from_str(&headers).map_err(|_| StoreError::Corrupt)?,
-            content_type,
-            body: body.into(),
-            fetched_at: OffsetDateTime::from_unix_timestamp_nanos(
-                i128::from(fetched_at) * 1_000_000,
-            )
-            .map_err(|_| StoreError::Corrupt)?,
         }))
     }
 
-    fn put_blocking(&self, key: &str, fetched: &Fetched, tier: Tier) -> Result<(), StoreError> {
+    pub async fn captures_after(
+        &self,
+        after_id: i64,
+        n: usize,
+    ) -> Result<Vec<Capture>, StoreError> {
+        let store = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let conn = store.db.reader()?;
+            let mut stmt = conn.prepare("SELECT id, requested_url, final_url, status, headers, content_type, blob_sha256, fetched_at_ms, route, tier FROM captures WHERE id > ?1 ORDER BY id LIMIT ?2")?;
+            let rows = stmt.query_map(params![after_id, n.min(1000) as i64], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, u16>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, String>(6)?, row.get::<_, i64>(7)?, row.get::<_, Option<String>>(8)?, row.get::<_, Option<String>>(9)?))
+            })?.collect::<Result<Vec<_>, _>>()?;
+            drop(stmt);
+            store.db.recycle(conn);
+            rows.into_iter().map(|(id, requested, final_url, status, headers, content_type, hash, at, route, tier)| {
+                let body = fs::read(store.blob_path(&hash))?;
+                Ok(Capture { id, blob_sha256: hash, tier: stored_tier(tier.as_deref())?, fetched: Fetched {
+                    requested_url: requested.parse().map_err(|_| StoreError::Corrupt)?,
+                    final_url: final_url.parse().map_err(|_| StoreError::Corrupt)?, status,
+                    headers: serde_json::from_str(&headers).map_err(|_| StoreError::Corrupt)?, content_type, body: body.into(),
+                    fetched_at: OffsetDateTime::from_unix_timestamp_nanos(i128::from(at) * 1_000_000).map_err(|_| StoreError::Corrupt)?,
+                    route: match route.as_deref() { None | Some("direct") => Route::Direct, Some("proxy") => Route::Proxy, _ => return Err(StoreError::Corrupt) },
+                }})
+            }).collect()
+        }).await.map_err(|_| StoreError::Task)?
+    }
+
+    fn put_blocking(&self, key: &str, fetched: &Fetched, tier: Tier) -> Result<i64, StoreError> {
         let hash = sha256_hex(&fetched.body);
         write_blob(&self.blobs, &hash, &fetched.body)?;
         let headers: Vec<_> = fetched
@@ -337,7 +434,7 @@ impl Store {
                 },
             ],
         )?;
-        Ok(())
+        Ok(db.last_insert_rowid())
     }
 
     fn blob_path(&self, hash: &str) -> PathBuf {
@@ -455,6 +552,15 @@ impl Store {
             }
         }
         Ok(unreferenced.len())
+    }
+}
+
+/// Rows written before the `tier` column existed are HTTP captures.
+fn stored_tier(tier: Option<&str>) -> Result<Tier, StoreError> {
+    match tier {
+        None | Some("http") => Ok(Tier::Http),
+        Some("browser") => Ok(Tier::Browser),
+        Some(_) => Err(StoreError::Corrupt),
     }
 }
 

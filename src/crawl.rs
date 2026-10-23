@@ -116,7 +116,7 @@ impl Scope {
             seed: seed.to_string(),
             include: compile(&opts.include_paths)?,
             exclude: compile(&opts.exclude_paths)?,
-            host: seed.host_str().unwrap_or_default().to_ascii_lowercase(),
+            host: canonical_host(seed).to_owned(),
             domain_host: matches!(seed.host(), Some(Host::Domain(_))),
             prefix: seed.path().trim_end_matches('/').to_owned(),
             options: opts,
@@ -134,7 +134,7 @@ impl Scope {
         {
             return false;
         }
-        let host = url.host_str().unwrap_or_default();
+        let host = canonical_host(url);
         let same_host = host.eq_ignore_ascii_case(&self.host);
         let subdomain = opts.allow_subdomains
             && self.domain_host
@@ -168,16 +168,19 @@ fn path_depth(url: &Url) -> usize {
         .count()
 }
 
+fn canonical_host(url: &Url) -> &str {
+    let host = url.host_str().unwrap_or_default();
+    host.strip_prefix("www.").unwrap_or(host)
+}
+
 pub fn dedup_key(url: &Url, ignore_query: bool) -> String {
     let mut normalized = url.clone();
     normalized.set_fragment(None);
     if ignore_query {
         normalized.set_query(None);
     }
-    if let Some(Host::Domain(host)) = url.host()
-        && let Some(host) = host.strip_prefix("www.")
-    {
-        let _ = normalized.set_host(Some(host));
+    if matches!(url.host(), Some(Host::Domain(_))) {
+        let _ = normalized.set_host(Some(canonical_host(url)));
     }
     if matches!(
         (normalized.scheme(), normalized.port()),
@@ -268,6 +271,7 @@ pub async fn map(
         {
             results.push(url.to_string());
         }
+        results.len() >= req.limit
     };
     let mut discovery_succeeded = false;
     let mut last_error = None;
@@ -306,7 +310,7 @@ pub async fn map(
             queue.push_back((root, 0));
         }
         let mut fetched_files = 0;
-        while let Some((url, depth)) = queue.pop_front() {
+        'sitemaps: while let Some((url, depth)) = queue.pop_front() {
             if fetched_files == 20 {
                 break;
             }
@@ -325,7 +329,9 @@ pub async fn map(
                         Ok(SitemapEntries::Urls(urls)) => {
                             discovery_succeeded = true;
                             for url in urls {
-                                add(url);
+                                if add(url) {
+                                    break 'sitemaps;
+                                }
                             }
                         }
                         Ok(SitemapEntries::Sitemaps(urls)) => {

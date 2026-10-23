@@ -38,7 +38,11 @@ pub struct ScrapeRequest {
     pub raw_html: bool,
 }
 
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct Document {
+    pub capture_id: Option<i64>,
+    pub blob_sha256: Option<String>,
+    #[serde(with = "stored_route")]
     pub route: Route,
     /// Final URL after redirects.
     pub url: Url,
@@ -48,8 +52,66 @@ pub struct Document {
     pub cached_at: Option<OffsetDateTime>,
     pub rendered: Rendered,
     pub raw_html: Option<String>,
-    /// Screenshot URL and action results from an explicit browser visit.
+    /// Screenshot URL and action results from an explicit browser visit; never persisted,
+    /// since jobs do not run browser plans.
+    #[serde(skip)]
     pub browser: BrowserExtras,
+}
+
+mod stored_route {
+    use super::Route;
+    use serde::{Deserialize, Deserializer, Serializer};
+    pub fn serialize<S: Serializer>(route: &Route, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(match route {
+            Route::Direct => "direct",
+            Route::Proxy => "proxy",
+        })
+    }
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Route, D::Error> {
+        match String::deserialize(d)?.as_str() {
+            "direct" => Ok(Route::Direct),
+            "proxy" => Ok(Route::Proxy),
+            _ => Err(serde::de::Error::custom("invalid capture route")),
+        }
+    }
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+pub struct ScrapeTemplate {
+    pub headers: Vec<(String, String)>,
+    pub timeout_ms: u64,
+    pub max_age_ms: u64,
+    pub render: RenderOptions,
+    pub raw_html: bool,
+}
+
+impl ScrapeTemplate {
+    pub fn request(&self, url: &Url) -> ScrapeRequest {
+        ScrapeRequest {
+            url: url.to_string(),
+            headers: self.headers.clone(),
+            deadline: Instant::now() + Duration::from_millis(self.timeout_ms),
+            max_age: Duration::from_millis(self.max_age_ms),
+            render: self.render.clone(),
+            raw_html: self.raw_html,
+        }
+    }
+}
+
+impl From<&ScrapeRequest> for ScrapeTemplate {
+    fn from(req: &ScrapeRequest) -> Self {
+        Self {
+            headers: req.headers.clone(),
+            timeout_ms: req
+                .deadline
+                .saturating_duration_since(Instant::now())
+                .as_millis()
+                .max(1) as u64,
+            max_age_ms: req.max_age.as_millis() as u64,
+            render: req.render.clone(),
+            raw_html: req.raw_html,
+        }
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -68,8 +130,37 @@ pub enum ScrapeError {
     Browser(#[from] BrowserError),
 }
 
-type SharedFetch = Shared<BoxFuture<'static, Result<Fetched, FetchError>>>;
-type SharedRender = Shared<BoxFuture<'static, Result<Fetched, BrowserError>>>;
+impl ScrapeError {
+    /// One error-code vocabulary for interactive responses and persisted job failures.
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::Invalid(_) => "BAD_REQUEST",
+            Self::Blocked => "SCRAPE_ALL_ENGINES_FAILED",
+            Self::Unsupported(_) => "SCRAPE_UNSUPPORTED_FILE_ERROR",
+            Self::Pdf(DocumentError::Timeout) => "SCRAPE_TIMEOUT",
+            Self::Pdf(DocumentError::NoTextLayer) => "SCRAPE_PDF_OCR_REQUIRED",
+            Self::Pdf(DocumentError::Encrypted | DocumentError::Failed) => {
+                "SCRAPE_UNSUPPORTED_FILE_ERROR"
+            }
+            Self::Fetch(error) | Self::Browser(BrowserError::Fetch(error)) => match error {
+                FetchError::Timeout => "SCRAPE_TIMEOUT",
+                FetchError::Dns => "SCRAPE_DNS_RESOLUTION_ERROR",
+                FetchError::Tls => "SCRAPE_SSL_ERROR",
+                FetchError::Overloaded => "CONCURRENCY_QUEUE_TIMEOUT",
+                _ => "SCRAPE_SITE_ERROR",
+            },
+            Self::Browser(BrowserError::Action { .. }) => "SCRAPE_ACTION_ERROR",
+            Self::Browser(BrowserError::SessionNotFound) => "BROWSER_SESSION_NOT_FOUND",
+            Self::Browser(BrowserError::SessionLimit) => "BROWSER_SESSION_LIMIT",
+            Self::Browser(
+                BrowserError::Disabled | BrowserError::Unavailable(_) | BrowserError::Limit(_),
+            ) => "SCRAPE_ALL_ENGINES_FAILED",
+        }
+    }
+}
+
+type SharedFetch = Shared<BoxFuture<'static, Result<(Fetched, i64), FetchError>>>;
+type SharedRender = Shared<BoxFuture<'static, Result<(Fetched, i64), BrowserError>>>;
 
 #[derive(Clone)]
 pub struct Scraper {
@@ -123,23 +214,23 @@ impl Scraper {
         {
             return Ok(doc);
         }
-        let (fetched, hit) = self.fetch_http(url.clone(), headers.clone(), req).await?;
+        let (fetched, id, hit) = self.fetch_http(url.clone(), headers.clone(), req).await?;
         if self.browser.is_enabled()
             && let Escalation::Render { visible } = policy::classify_http(&fetched)
             && let Some(doc) = self.render_auto(&url, &headers, req, Some(visible)).await
         {
             return Ok(doc);
         }
-        finish(fetched, req, hit).await
+        render_stored(fetched, id, req, hit).await
     }
 
-    /// The HTTP capture: a fresh enough cached one, or a shared fetch.
+    /// The HTTP capture and its ID: a fresh enough cached one (`true`), or a shared fetch.
     async fn fetch_http(
         &self,
         url: Url,
         headers: Vec<(String, String)>,
         req: &ScrapeRequest,
-    ) -> Result<(Fetched, bool), ScrapeError> {
+    ) -> Result<(Fetched, i64, bool), ScrapeError> {
         let mut key_material = url.to_string();
         for (name, value) in &headers {
             key_material.push_str(&format!("\n{name}: {value}"));
@@ -147,8 +238,8 @@ impl Scraper {
         // Hashed so header values (possibly credentials) never reach the database.
         let key = store::sha256_hex(key_material.as_bytes());
         if !req.max_age.is_zero() {
-            match self.store.cached(&key, req.max_age).await {
-                Ok(Some(capture)) => return Ok((capture, true)),
+            match self.store.cached_capture(&key, req.max_age).await {
+                Ok(Some(capture)) => return Ok((capture.fetched, capture.id, true)),
                 Ok(None) => {}
                 Err(error) => tracing::warn!(%error, "capture cache unavailable"),
             }
@@ -159,7 +250,8 @@ impl Scraper {
             deadline: req.deadline,
             max_bytes: self.max_bytes,
         };
-        Ok((self.fetch_once(key, target).await?, false))
+        let (fetched, id) = self.fetch_once(key, target).await?;
+        Ok((fetched, id, false))
     }
 
     /// A caller-driven visit. Captures with actions are stored for the record under a key no
@@ -180,10 +272,12 @@ impl Scraper {
         } else {
             store::sha256_hex(format!("actions\n{}", uuid::Uuid::new_v4()).as_bytes())
         };
-        if let Err(error) = self.store.put_rendered(&key, &output.capture).await {
-            tracing::error!(%error, "rendered capture not stored");
-        }
-        let mut doc = finish(output.capture, req, false).await?;
+        let id = self
+            .store
+            .put_rendered(&key, &output.capture)
+            .await
+            .map_err(not_stored)?;
+        let mut doc = render_stored(output.capture, id, req, false).await?;
         doc.browser = output.extras;
         Ok(doc)
     }
@@ -205,14 +299,18 @@ impl Scraper {
         let cached = if req.max_age.is_zero() {
             None
         } else {
-            self.store.cached(&key, req.max_age).await.ok().flatten()
+            self.store
+                .cached_capture(&key, req.max_age)
+                .await
+                .ok()
+                .flatten()
         };
-        let (fetched, hit) = match cached {
-            Some(capture) => (capture, true),
+        let (fetched, id, hit) = match cached {
+            Some(capture) => (capture.fetched, capture.id, true),
             None => {
                 let render = self.render_once(key, url.clone(), headers.to_vec(), req.deadline);
                 match timeout_at(req.deadline, render).await {
-                    Ok(Ok(capture)) => (capture, false),
+                    Ok(Ok((capture, id))) => (capture, id, false),
                     _ => {
                         self.browser.forget(&origin);
                         return None;
@@ -225,7 +323,7 @@ impl Scraper {
             self.browser.forget(&origin);
             return None;
         }
-        match finish(fetched, req, hit).await {
+        match render_stored(fetched, id, req, hit).await {
             Ok(doc) => {
                 self.browser.remember(&origin);
                 Some(doc)
@@ -256,16 +354,19 @@ impl Scraper {
         let this = self.clone();
         let task_key = key.clone();
         let task = tokio::spawn(async move {
-            let result = this
-                .browser
-                .render(&url, &headers, deadline, &BrowserPlan::default())
-                .await
-                .map(|output| output.capture);
-            if let Ok(capture) = &result
-                && let Err(error) = this.store.put_rendered(&task_key, capture).await
-            {
-                tracing::error!(%error, "rendered capture not stored");
+            let result = async {
+                let output = this
+                    .browser
+                    .render(&url, &headers, deadline, &BrowserPlan::default())
+                    .await?;
+                let id = this
+                    .store
+                    .put_rendered(&task_key, &output.capture)
+                    .await
+                    .map_err(not_stored)?;
+                Ok((output.capture, id))
             }
+            .await;
             let mut rendering = this
                 .rendering
                 .lock()
@@ -293,12 +394,15 @@ impl Scraper {
         let this = self.clone();
         let task_key = key.clone();
         let task = tokio::spawn(async move {
-            let result = this.fetcher.fetch(&target).await;
-            if let Ok(fetched) = &result
-                && let Err(error) = this.store.put(&task_key, fetched).await
-            {
-                tracing::error!(%error, "capture not stored");
+            let result = async {
+                let fetched = this.fetcher.fetch(&target).await?;
+                let id = this.store.put(&task_key, &fetched).await.map_err(|error| {
+                    tracing::error!(%error, "capture not stored");
+                    FetchError::Protocol
+                })?;
+                Ok((fetched, id))
             }
+            .await;
             let mut inflight = this.inflight.lock().unwrap_or_else(PoisonError::into_inner);
             inflight.remove(&task_key);
             result
@@ -324,7 +428,9 @@ pub fn normalize(input: &str) -> Result<Url, ScrapeError> {
 }
 
 /// Validated, lowercased, and sorted, so equal header sets share one cache key.
-fn request_headers(headers: &[(String, String)]) -> Result<Vec<(String, String)>, ScrapeError> {
+pub(crate) fn request_headers(
+    headers: &[(String, String)],
+) -> Result<Vec<(String, String)>, ScrapeError> {
     let mut valid = headers
         .iter()
         .map(|(name, value)| {
@@ -339,7 +445,30 @@ fn request_headers(headers: &[(String, String)]) -> Result<Vec<(String, String)>
     Ok(valid)
 }
 
-async fn finish(fetched: Fetched, req: &ScrapeRequest, hit: bool) -> Result<Document, ScrapeError> {
+/// A capture whose provenance is not recorded is not returned, as for plain fetches.
+fn not_stored(error: crate::store::StoreError) -> BrowserError {
+    tracing::error!(%error, "rendered capture not stored");
+    BrowserError::Unavailable("rendered capture not stored")
+}
+
+/// Renders a stored capture and records which capture it came from.
+async fn render_stored(
+    fetched: Fetched,
+    id: i64,
+    req: &ScrapeRequest,
+    hit: bool,
+) -> Result<Document, ScrapeError> {
+    let mut doc = render_capture(fetched, req, hit).await?;
+    doc.capture_id = Some(id);
+    Ok(doc)
+}
+
+pub async fn render_capture(
+    fetched: Fetched,
+    req: &ScrapeRequest,
+    hit: bool,
+) -> Result<Document, ScrapeError> {
+    let blob_sha256 = Some(store::sha256_hex(&fetched.body));
     let mime = fetched.content_type.as_deref().map(|value| {
         let essence = value.split_once(';').map_or(value, |(essence, _)| essence);
         essence.trim().to_ascii_lowercase()
@@ -364,6 +493,8 @@ async fn finish(fetched: Fetched, req: &ScrapeRequest, hit: bool) -> Result<Docu
             .extra
             .insert("numPages".into(), pdf.pages.to_string());
         return Ok(Document {
+            capture_id: None,
+            blob_sha256,
             route: fetched.route,
             url: fetched.final_url,
             status: fetched.status,
@@ -391,6 +522,8 @@ async fn finish(fetched: Fetched, req: &ScrapeRequest, hit: bool) -> Result<Docu
         Some(m) => return Err(ScrapeError::Unsupported(m.to_owned())),
     };
     Ok(Document {
+        capture_id: None,
+        blob_sha256,
         route: fetched.route,
         url: fetched.final_url,
         status: fetched.status,

@@ -68,6 +68,7 @@ pub async fn pdf_to_markdown(bytes: &[u8], deadline: Instant) -> Result<PdfText,
             .await
             .map_err(|_| DocumentError::Failed)?;
         let mut child = Command::new(std::env::current_exe().map_err(|_| DocumentError::Failed)?)
+            .env_clear()
             .arg("extract-pdf")
             .kill_on_drop(true)
             .stdin(Stdio::piped())
@@ -112,6 +113,15 @@ pub async fn pdf_to_markdown(bytes: &[u8], deadline: Instant) -> Result<PdfText,
 
 /// Worker entry point: never prints parser diagnostics or document contents to stderr.
 pub fn extract_pdf_stdio() -> Result<(), DocumentError> {
+    #[cfg(unix)]
+    {
+        rlimit::Resource::AS
+            .set(1024 * 1024 * 1024, 1024 * 1024 * 1024)
+            .map_err(|_| DocumentError::Failed)?;
+        rlimit::Resource::CPU
+            .set(30, 30)
+            .map_err(|_| DocumentError::Failed)?;
+    }
     let mut bytes = Vec::new();
     std::io::stdin()
         .lock()

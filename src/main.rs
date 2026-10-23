@@ -1,4 +1,4 @@
-//! `sonar` command line: serve, scrape, search.
+//! `sonar` command line: serve, scrape, search, export.
 
 use std::{error::Error, io::IsTerminal, process::ExitCode, sync::Arc, time::Duration};
 
@@ -32,6 +32,15 @@ enum Command {
     Scrape { url: String },
     /// Search the web and print the hits.
     Search { query: String },
+    /// Export successful capture history as JSON Lines (never overwrites an existing file).
+    Export {
+        #[arg(long)]
+        since: Option<String>,
+        #[arg(long)]
+        host: Option<String>,
+        #[arg(long)]
+        out: Option<std::path::PathBuf>,
+    },
     #[command(hide = true)]
     ExtractPdf,
 }
@@ -53,7 +62,8 @@ async fn shutdown_signal() {
     }
 }
 
-/// Serves until a signal; the browser tier stops after in-flight requests have drained.
+/// Serves until a signal; the browser tier stops after requests and jobs have drained. It
+/// starts first, so job scrapes use it too.
 async fn serve(cfg: &Config, fetcher: Fetcher) -> Result<(), Box<dyn Error>> {
     let state = api::AppState::new(cfg, fetcher.clone())?
         .start_browser(cfg, &fetcher)
@@ -66,7 +76,9 @@ async fn serve(cfg: &Config, fetcher: Fetcher) -> Result<(), Box<dyn Error>> {
 
 /// Stops accepting on a signal, then gives in-flight requests up to the longest request
 /// timeout to finish.
-async fn serve_until_signal(cfg: &Config, state: api::AppState) -> Result<(), Box<dyn Error>> {
+async fn serve_until_signal(cfg: &Config, mut state: api::AppState) -> Result<(), Box<dyn Error>> {
+    let mut dispatcher = state.start_jobs().await?;
+    let jobs_state = state.clone();
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(bind = %cfg.bind, "serving");
     let stop = Arc::new(tokio::sync::Notify::new());
@@ -75,29 +87,41 @@ async fn serve_until_signal(cfg: &Config, state: api::AppState) -> Result<(), Bo
         .with_graceful_shutdown(async move { stopped.notified().await });
     let mut server = std::pin::pin!(server.into_future());
     tokio::select! {
-        result = &mut server => return Ok(result?),
+        result = &mut server => {
+            jobs_state.stop_jobs();
+            dispatcher.await?;
+            return Ok(result?);
+        },
+        result = &mut dispatcher => {
+            jobs_state.stop_jobs();
+            stop.notify_one();
+            result?;
+            return Err("job dispatcher stopped unexpectedly".into());
+        },
         () = shutdown_signal() => {}
     }
     tracing::info!("draining in-flight requests");
+    jobs_state.stop_jobs();
     stop.notify_one();
     let grace = Duration::from_millis(cfg.max_timeout_ms);
-    match tokio::time::timeout(grace, server).await {
-        Ok(result) => Ok(result?),
+    let result = match tokio::time::timeout(grace, server).await {
+        Ok(result) => result,
         Err(_) => {
             tracing::warn!("grace period elapsed; dropping remaining requests");
             Ok(())
         }
-    }
+    };
+    dispatcher.await?;
+    Ok(result?)
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     let cfg = cli.config;
-    let fetcher = Fetcher::new(&cfg)?;
     match cli.command {
         Command::ExtractPdf => dripsonar::document::extract_pdf_stdio()?,
-        Command::Serve => serve(&cfg, fetcher).await?,
+        Command::Serve => serve(&cfg, Fetcher::new(&cfg)?).await?,
         Command::Scrape { url } => {
-            let store = Store::open(&cfg.data_dir)?;
+            let (fetcher, store) = (Fetcher::new(&cfg)?, Store::open(&cfg.data_dir)?);
             let browser = BrowserTier::start(&cfg, &fetcher, store.clone()).await?;
             let scraper = Scraper::new(fetcher, store, &cfg).with_browser(browser.clone());
             let request = ScrapeRequest {
@@ -119,10 +143,19 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         }
         Command::Search { query } => {
             let deadline = Instant::now() + Duration::from_secs(60);
-            let hits = Searcher::new(fetcher, &cfg)
+            let hits = Searcher::new(Fetcher::new(&cfg)?, &cfg)
                 .search(&query, 5, "en", deadline)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&hits)?);
+        }
+        Command::Export { since, host, out } => {
+            dripsonar::export::export(
+                &Store::open(&cfg.data_dir)?,
+                since.as_deref(),
+                host.as_deref(),
+                out.as_deref(),
+            )
+            .await?;
         }
     }
     Ok(())
@@ -141,6 +174,7 @@ async fn main() -> ExitCode {
         };
     }
     tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),

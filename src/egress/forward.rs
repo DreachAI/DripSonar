@@ -45,7 +45,17 @@ impl ForwardProxy {
                 while connections.try_join_next().is_some() {}
                 tokio::select! {
                     result = listener.accept() => {
-                        let Ok((mut stream, _)) = result else { break };
+                        let (mut stream, _) = match result {
+                            Ok(connection) => connection,
+                            Err(error) => {
+                                tracing::warn!(kind = ?error.kind(), "forward proxy accept failed");
+                                if matches!(error.kind(), io::ErrorKind::InvalidInput | io::ErrorKind::NotConnected) {
+                                    break;
+                                }
+                                tokio::time::sleep(Duration::from_millis(50)).await;
+                                continue;
+                            }
+                        };
                         let Ok(permit) = Arc::clone(&slots).try_acquire_owned() else {
                             // A full queue must not create another waiting task or connection.
                             let _ = stream.try_write(b"HTTP/1.1 503 Service Unavailable\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");

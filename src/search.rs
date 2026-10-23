@@ -71,12 +71,12 @@ fn duckduckgo_hits(document: &Document) -> Vec<Hit> {
             return None;
         }
         let href = anchor.attr("href")?;
-        let href = if href.starts_with("//") {
+        let mut href = if href.starts_with("//") {
             format!("https:{href}")
         } else {
             href.to_string()
         };
-        let mut url = Url::parse(&href).ok()?;
+        let url = Url::parse(&href).ok()?;
         if matches!(
             url.host_str(),
             Some("duckduckgo.com" | "www.duckduckgo.com")
@@ -90,11 +90,11 @@ fn duckduckgo_hits(document: &Document) -> Vec<Hit> {
                     .find(|(key, _)| key == "uddg")?
                     .1
                     .into_owned();
-                url = Url::parse(&destination).ok()?;
+                href = destination;
             }
         }
         Some(Hit {
-            url: url.to_string(),
+            url: href,
             title: anchor.text().to_string(),
             description: ancestors
                 .filter(".result")
@@ -181,15 +181,11 @@ fn normalize(hits: impl IntoIterator<Item = Hit>) -> Vec<Hit> {
     let mut seen = HashSet::new();
     hits.into_iter()
         .filter_map(|mut hit| {
-            let mut url = Url::parse(&hit.url).ok()?;
+            let url = Url::parse(&hit.url).ok()?;
             if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
                 return None;
             }
-            url.set_fragment(None);
-            let path = url.path().trim_end_matches('/').to_owned();
-            url.set_path(&path);
-            hit.url = url.to_string();
-            if !seen.insert(hit.url.clone()) {
+            if !seen.insert(crate::crawl::dedup_key(&url, false)) {
                 return None;
             }
             hit.title = clean_text(&hit.title, 500);
@@ -408,37 +404,38 @@ where
         Provider::Mojeek,
         Provider::Brave,
     ]);
+    let mut providers_left = if searxng.is_some() { 4 } else { 3 };
     for provider in providers {
+        let now = Instant::now();
+        let provider_deadline = now
+            + (deadline.saturating_duration_since(now) / providers_left)
+                .min(Duration::from_secs(10));
+        providers_left -= 1;
         let mut hits = Vec::new();
         let mut seen = HashSet::new();
         let pages = provider.pages();
         for page in 1..=pages {
-            if Instant::now() >= deadline {
-                return Err(SearchError::Timeout);
+            if Instant::now() >= provider_deadline {
+                break;
             }
             let target = Target {
                 url: provider.url(query, lang, page)?,
                 headers: Vec::new(),
-                deadline,
+                deadline: provider_deadline,
                 max_bytes: MAX_RESPONSE_BYTES,
             };
-            let response = timeout_at(deadline, fetch(target)).await;
-            if Instant::now() >= deadline || response.is_err() {
-                return Err(SearchError::Timeout);
-            }
+            let response = timeout_at(provider_deadline, fetch(target)).await;
             let fetched = match response {
                 Ok(Ok(fetched)) if (200..300).contains(&fetched.status) => fetched,
-                Ok(Err(FetchError::Timeout)) => return Err(SearchError::Timeout),
                 _ => break,
             };
             let Ok((page_hits, has_results)) = provider.parse(&fetched) else {
                 break;
             };
-            hits.extend(
-                page_hits
-                    .into_iter()
-                    .filter(|hit| seen.insert(hit.url.clone())),
-            );
+            hits.extend(page_hits.into_iter().filter(|hit| {
+                Url::parse(&hit.url)
+                    .is_ok_and(|url| seen.insert(crate::crawl::dedup_key(&url, false)))
+            }));
             if Instant::now() >= deadline {
                 return Err(SearchError::Timeout);
             }
@@ -447,8 +444,16 @@ where
                 return Ok(hits);
             }
         }
+        if !hits.is_empty() {
+            hits.truncate(limit);
+            return Ok(hits);
+        }
     }
-    Err(SearchError::AllProvidersFailed)
+    if Instant::now() >= deadline {
+        Err(SearchError::Timeout)
+    } else {
+        Err(SearchError::AllProvidersFailed)
+    }
 }
 
 #[cfg(test)]

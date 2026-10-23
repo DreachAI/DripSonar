@@ -32,7 +32,7 @@ const CHALLENGE_TITLES: [&str; 6] = [
 ];
 const CHALLENGE_BODY_MARKERS: [&str; 2] = ["_cf_chl_opt", "/cdn-cgi/challenge-platform/"];
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct RenderOptions {
     pub only_main_content: bool,
     pub include_tags: Vec<String>,
@@ -43,7 +43,7 @@ pub struct RenderOptions {
     pub links: bool,
 }
 
-#[derive(Clone, Debug, Default, serde::Serialize)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PageMetadata {
     pub title: Option<String>,
@@ -67,7 +67,7 @@ pub struct PageMetadata {
     pub extra: BTreeMap<String, String>,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Rendered {
     pub markdown: Option<String>,
     pub html: Option<String>,

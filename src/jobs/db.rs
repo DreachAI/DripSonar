@@ -2,7 +2,6 @@
 
 use super::*;
 use rusqlite::{OptionalExtension, Transaction, params};
-use std::collections::HashMap;
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS jobs (
@@ -16,9 +15,11 @@ CREATE TABLE IF NOT EXISTS frontier (
  depth INTEGER NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
  seq INTEGER, content_sha TEXT, capture_id INTEGER, blob_sha256 TEXT,
  error_code TEXT, finished_ms INTEGER, UNIQUE(job_id, task, key));
-CREATE INDEX IF NOT EXISTS frontier_ready ON frontier(state, host, id);
+DROP INDEX IF EXISTS frontier_ready;
 CREATE INDEX IF NOT EXISTS frontier_job ON frontier(job_id, seq);
 CREATE INDEX IF NOT EXISTS frontier_dup ON frontier(job_id, content_sha);
+CREATE INDEX IF NOT EXISTS frontier_open ON frontier(job_id) WHERE state IN ('queued','leased');
+CREATE INDEX IF NOT EXISTS frontier_job_hosts ON frontier(job_id, host, id) WHERE state='queued';
 CREATE TABLE IF NOT EXISTS documents (
  frontier_id INTEGER PRIMARY KEY REFERENCES frontier(id) ON DELETE CASCADE, doc TEXT NOT NULL);
 ";
@@ -74,19 +75,41 @@ pub async fn initialize(store: &Store, retention: u64) -> Result<(), StoreError>
         .await
 }
 
-pub async fn hosts(store: &Store) -> Result<Vec<(String, u64)>, StoreError> {
+pub async fn active(store: &Store) -> Result<Vec<(String, u64)>, StoreError> {
     store
         .read(|conn| {
             let mut stmt = conn.prepare(
-                "SELECT f.host, MAX(COALESCE(json_extract(j.spec,'$.delay_ms'),0))
-             FROM frontier f JOIN jobs j ON j.id=f.job_id
-             WHERE f.state='queued' AND j.status='scraping' GROUP BY f.host",
+                "SELECT id, MIN(COALESCE(json_extract(spec,'$.delay_ms'),0),60000)
+                 FROM jobs WHERE status='scraping' ORDER BY created_ms,id",
             )?;
             Ok(stmt
                 .query_map([], |row| {
                     Ok((row.get(0)?, u64::from(row.get::<_, u32>(1)?)))
                 })?
                 .collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+}
+
+pub async fn hosts(store: &Store, job: String, after: String) -> Result<Vec<String>, StoreError> {
+    store
+        .read(move |conn| {
+            let mut stmt = conn.prepare(
+            "SELECT DISTINCT host FROM frontier INDEXED BY frontier_job_hosts WHERE job_id=?1 AND state='queued'
+             AND host>?2 AND EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND status='scraping')
+             ORDER BY host LIMIT ?3",
+            )?;
+            let mut page = |after: &str| -> Result<Vec<String>, StoreError> {
+                Ok(stmt
+                    .query_map(params![job, after, sched::HOST_PAGE as i64], |r| r.get(0))?
+                    .collect::<Result<Vec<_>, _>>()?)
+            };
+            let hosts = page(&after)?;
+            if hosts.is_empty() && !after.is_empty() {
+                page("")
+            } else {
+                Ok(hosts)
+            }
         })
         .await
 }
@@ -118,7 +141,8 @@ pub async fn submit(
     cfg: &Config,
 ) -> Result<Vec<(String, u64)>, JobError> {
     let (max_active, retention) = (cfg.max_active_jobs, cfg.job_retention_hours);
-    let hosts = store
+    let delay = spec.delay_ms.unwrap_or(0);
+    let inserted = store
         .write(move |tx| {
             let active: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM jobs WHERE status='scraping'",
@@ -149,7 +173,6 @@ pub async fn submit(
                 .scope
                 .as_ref()
                 .is_some_and(|s| s.options().ignore_query_parameters);
-            let mut hosts = HashMap::new();
             let mut pages = 0u32;
             let mut sitemaps = 0;
             for seed in seeds {
@@ -162,10 +185,6 @@ pub async fn submit(
                 if insert(tx, &id, &seed, 0, ignore_query)? {
                     pages += u32::from(seed.task == Task::Page);
                     sitemaps += usize::from(seed.task == Task::Sitemap);
-                    hosts.insert(
-                        seed.url.host_str().unwrap_or_default().to_owned(),
-                        spec.delay_ms.unwrap_or(0),
-                    );
                 }
             }
             tx.execute(
@@ -173,22 +192,23 @@ pub async fn submit(
                 params![id, pages],
             )?;
             finish(tx, &id, retention)?;
-            Ok(Some(hosts.into_iter().collect()))
+            Ok(Some(()))
         })
         .await?;
-    hosts.ok_or(JobError::Overloaded)
+    inserted.ok_or(JobError::Overloaded)?;
+    Ok(vec![(id.to_string(), delay)])
 }
 
-pub async fn lease(store: &Store, host: String) -> Result<Option<Work>, StoreError> {
+pub async fn lease(store: &Store, job: String, host: String) -> Result<Option<Work>, StoreError> {
     store
         .write(move |tx| {
             let row = tx
                 .query_row(
                     "UPDATE frontier SET state='leased',attempts=attempts+1 WHERE id=(
              SELECT f.id FROM frontier f JOIN jobs j ON j.id=f.job_id
-             WHERE f.state='queued' AND f.host=?1 AND j.status='scraping' ORDER BY f.id LIMIT 1)
+              WHERE f.state='queued' AND f.host=?1 AND f.job_id=?2 AND j.status='scraping' ORDER BY f.id LIMIT 1)
              RETURNING id,job_id,task,url,depth",
-                    [host],
+                    params![host, job],
                     |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
@@ -231,7 +251,7 @@ fn finish(tx: &Transaction<'_>, id: &str, retention: u64) -> Result<(), StoreErr
         "UPDATE jobs SET status=CASE WHEN completed=0 AND failed>0 THEN 'failed' ELSE 'completed' END,
          updated_ms=?2, expires_ms=?3, spec=json_set(spec,'$.scrape.headers',json('[]'))
          WHERE id=?1 AND status='scraping' AND NOT EXISTS(
-         SELECT 1 FROM frontier WHERE job_id=?1 AND state IN ('queued','leased'))",
+          SELECT 1 FROM frontier INDEXED BY frontier_open WHERE job_id=?1 AND state IN ('queued','leased'))",
         params![id, now, expiry(now, retention)])?;
     Ok(())
 }
@@ -241,7 +261,8 @@ pub async fn complete(
     work: Work,
     out: Outcome,
     retention: u64,
-) -> Result<Vec<(String, u64)>, StoreError> {
+) -> Result<(), StoreError> {
+    let doc = out.doc.map(|doc| encode(&doc)).transpose()?;
     store.write(move |tx| {
         let now = now_ms();
         // Both checks are essential: a cancelled job must not accept an in-flight document.
@@ -251,14 +272,14 @@ pub async fn complete(
              SELECT 1 FROM jobs WHERE id=frontier.job_id AND status='scraping')",
             params![work.id, if out.error.is_some() { "failed" } else { "done" },
                 out.content_sha, out.capture_id, out.blob_sha256, out.error, now])?;
-        if changed == 0 { return Ok(Vec::new()); }
+        if changed == 0 { return Ok(()); }
         if work.task == Task::Page {
-            if let Some(doc) = out.doc {
+            if let Some(doc) = doc {
                 tx.execute("UPDATE jobs SET completed=completed+1,updated_ms=?2 WHERE id=?1",
                     params![work.job_id, now])?;
                 tx.execute("UPDATE frontier SET seq=(SELECT completed FROM jobs WHERE id=?2) WHERE id=?1",
                     params![work.id, work.job_id])?;
-                tx.execute("INSERT INTO documents(frontier_id,doc) VALUES(?1,?2)", params![work.id, encode(&doc)?])?;
+                tx.execute("INSERT INTO documents(frontier_id,doc) VALUES(?1,?2)", params![work.id, doc])?;
             } else {
                 tx.execute("UPDATE jobs SET failed=failed+1,updated_ms=?2 WHERE id=?1", params![work.job_id, now])?;
             }
@@ -266,7 +287,6 @@ pub async fn complete(
         let duplicate: bool = tx.query_row(
             "SELECT EXISTS(SELECT 1 FROM frontier WHERE job_id=?1 AND id!=?2 AND content_sha=?3)",
             params![work.job_id, work.id, out.content_sha], |row| row.get(0))?;
-        let mut hosts = HashMap::new();
         if !duplicate && out.error.is_none() {
             let mut discovered: u32 = tx.query_row("SELECT discovered FROM jobs WHERE id=?1",
                 [&work.job_id], |row| row.get(0))?;
@@ -282,13 +302,12 @@ pub async fn complete(
                 if insert(tx, &work.job_id, &seed, depth, ignore_query)? {
                     discovered += u32::from(seed.task == Task::Page);
                     sitemaps += u32::from(seed.task == Task::Sitemap);
-                    hosts.insert(seed.url.host_str().unwrap_or_default().to_owned(), work.spec.delay_ms.unwrap_or(0));
                 }
             }
             tx.execute("UPDATE jobs SET discovered=?2 WHERE id=?1", params![work.job_id, discovered])?;
         }
         finish(tx, &work.job_id, retention)?;
-        Ok(hosts.into_iter().collect())
+        Ok(())
     }).await
 }
 
@@ -303,7 +322,9 @@ pub async fn status(
     store.read(move |conn| {
         let tx = conn.unchecked_transaction()?;
         let row = tx.query_row(
-            "SELECT status,completed,discovered,expires_ms,request FROM jobs WHERE id=?1 AND kind=?2",
+            "SELECT status,completed,completed+(SELECT COUNT(*) FROM frontier INDEXED BY frontier_open
+             WHERE job_id=jobs.id AND task='page' AND state IN ('queued','leased')),expires_ms,request
+             FROM jobs WHERE id=?1 AND kind=?2",
             params![id.to_string(), kind_name(kind)], |r| {
                 Ok((r.get::<_, String>(0)?, u64::from(r.get::<_, u32>(1)?),
                     u64::from(r.get::<_, u32>(2)?), r.get::<_, i64>(3)?, r.get::<_, String>(4)?))
@@ -329,14 +350,18 @@ pub async fn status(
     }).await
 }
 
-pub async fn errors(store: &Store, id: JobId) -> Result<Option<Vec<PageError>>, StoreError> {
+pub async fn errors(
+    store: &Store,
+    id: JobId,
+    kind: JobKind,
+) -> Result<Option<Vec<PageError>>, StoreError> {
     store
         .read(move |conn| {
             let tx = conn.unchecked_transaction()?;
             let id = id.to_string();
             if !tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND kind='crawl')",
-                [&id],
+                "SELECT EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND kind=?2)",
+                params![id, kind_name(kind)],
                 |row| row.get::<_, bool>(0),
             )? {
                 return Ok(None);
@@ -358,7 +383,7 @@ pub async fn errors(store: &Store, id: JobId) -> Result<Option<Vec<PageError>>, 
             rows.into_iter()
                 .map(|(id, url, code, at)| {
                     Ok(PageError {
-                        id,
+                        id: id.to_string(),
                         url,
                         code,
                         at: timestamp(at)?,
@@ -375,7 +400,7 @@ pub async fn cancel(
     id: JobId,
     kind: JobKind,
     retention: u64,
-) -> Result<bool, StoreError> {
+) -> Result<Option<bool>, StoreError> {
     store
         .write(move |tx| {
             let id = id.to_string();
@@ -385,20 +410,61 @@ pub async fn cancel(
                 |row| row.get(0),
             )?;
             if !exists {
-                return Ok(false);
+                return Ok(None);
             }
             let now = now_ms();
-            tx.execute(
+            let changed = tx.execute(
                 "UPDATE jobs SET status='cancelled',updated_ms=?2,expires_ms=?3,
-             spec=json_set(spec,'$.scrape.headers',json('[]')) WHERE id=?1",
+             spec=json_set(spec,'$.scrape.headers',json('[]')) WHERE id=?1 AND status='scraping'",
                 params![id, now, expiry(now, retention)],
             )?;
+            if changed == 0 {
+                return Ok(Some(false));
+            }
             tx.execute(
                 "UPDATE frontier SET state='cancelled',finished_ms=?2
              WHERE job_id=?1 AND state IN ('queued','leased')",
                 params![id, now],
             )?;
-            Ok(true)
+            Ok(Some(true))
+        })
+        .await
+}
+
+/// Refund storage failures and orderly interruption, but retain the three-crash bound.
+pub async fn requeue(
+    store: &Store,
+    ids: Option<Vec<(i64, bool)>>,
+    retention: u64,
+) -> Result<(), StoreError> {
+    store
+        .write(move |tx| {
+            if let Some(ids) = ids {
+            for (id, refund_attempt) in ids {
+                let row = tx.query_row(
+                    "UPDATE frontier SET state=CASE WHEN ?2 OR attempts<3 THEN 'queued' ELSE 'failed' END,
+                     attempts=MAX(attempts-?2,0),
+                     error_code=CASE WHEN NOT ?2 AND attempts>=3 THEN 'SCRAPE_CRASH_LOOP' END,
+                     finished_ms=CASE WHEN NOT ?2 AND attempts>=3 THEN ?3 END
+                     WHERE id=?1 AND state='leased' RETURNING job_id,task,state",
+                    params![id, refund_attempt, now_ms()], |r| {
+                        Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?, r.get::<_, String>(2)?))
+                    }).optional()?;
+                if let Some((job, task, state)) = row && state == "failed" {
+                    if task == "page" {
+                        tx.execute("UPDATE jobs SET failed=failed+1 WHERE id=?1", [&job])?;
+                    }
+                    finish(tx, &job, retention)?;
+                }
+                }
+            } else {
+                tx.execute(
+                    "UPDATE frontier SET state='queued',attempts=MAX(attempts-1,0)
+                        WHERE state='leased'",
+                    [],
+                )?;
+            }
+            Ok(())
         })
         .await
 }

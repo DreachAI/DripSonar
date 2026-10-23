@@ -148,6 +148,7 @@ impl Store {
         // NORMAL is crash-safe in WAL: a power loss can drop the newest rows, never corrupt.
         writer.pragma_update(None, "synchronous", "NORMAL")?;
         writer.pragma_update(None, "foreign_keys", true)?;
+        writer.pragma_update(None, "secure_delete", true)?;
         writer.execute_batch(SCHEMA)?;
         // Serialize schema inspection and ALTER across simultaneous opens of an old store.
         let writer = {

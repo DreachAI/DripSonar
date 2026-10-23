@@ -1,24 +1,35 @@
-//! Host scheduling is advisory; the network gate remains the authority for politeness.
+//! Jobs get round-robin turns; each holds only one bounded SQL page of hosts.
 
 use std::{
-    cmp::Reverse,
-    collections::{BinaryHeap, HashMap},
+    collections::{HashMap, VecDeque},
     time::Duration,
 };
 use tokio::time::Instant;
 
+pub(super) const HOST_PAGE: usize = 64;
+
 struct Host {
     inflight: usize,
     next: Instant,
-    last_started: Option<Instant>,
-    spacing: Duration,
-    queued: bool,
-    in_heap: bool,
+}
+
+struct Job {
+    hosts: VecDeque<String>,
+    cursor: String,
+    next_at: Instant,
+    delay: Duration,
+    inflight: usize,
+}
+
+pub(super) enum Next {
+    Refill { job: String, after: String },
+    Lease { job: String, host: String },
 }
 
 pub(super) struct Scheduler {
+    jobs: HashMap<String, Job>,
+    turns: VecDeque<String>,
     hosts: HashMap<String, Host>,
-    ready: BinaryHeap<Reverse<(Instant, String)>>,
     concurrency: usize,
     spacing: Duration,
 }
@@ -26,81 +37,123 @@ pub(super) struct Scheduler {
 impl Scheduler {
     pub fn new(concurrency: usize, spacing_ms: u64) -> Self {
         Self {
+            jobs: HashMap::new(),
+            turns: VecDeque::new(),
             hosts: HashMap::new(),
-            ready: BinaryHeap::new(),
             concurrency,
             spacing: Duration::from_millis(spacing_ms),
         }
     }
 
-    pub fn wake(&mut self, host: String, delay_ms: u64) {
-        let entry = self.hosts.entry(host.clone()).or_insert(Host {
+    pub fn wake(&mut self, id: String, delay_ms: u64) {
+        self.jobs.entry(id.clone()).or_insert_with(|| Job {
+            hosts: VecDeque::new(),
+            cursor: String::new(),
+            next_at: Instant::now(),
+            delay: Duration::from_millis(delay_ms),
             inflight: 0,
-            next: Instant::now(),
-            last_started: None,
-            spacing: self.spacing,
-            queued: true,
-            in_heap: false,
         });
-        entry.queued = true;
-        entry.spacing = entry.spacing.max(Duration::from_millis(delay_ms));
-        if let Some(last) = entry.last_started {
-            entry.next = entry.next.max(last + entry.spacing);
+        if !self.turns.contains(&id) {
+            self.turns.push_back(id);
         }
-        self.push(&host);
     }
 
-    fn push(&mut self, host: &str) {
-        if let Some(entry) = self.hosts.get_mut(host)
-            && entry.queued
-            && !entry.in_heap
-            && entry.inflight < self.concurrency
-        {
-            self.ready.push(Reverse((entry.next, host.to_owned())));
-            entry.in_heap = true;
+    pub fn refill(&mut self, id: &str, hosts: Vec<String>) {
+        if let Some(job) = self.jobs.get_mut(id) {
+            if let Some(last) = hosts.last() {
+                job.cursor.clone_from(last);
+                job.hosts = hosts.into();
+            } else {
+                self.turns.retain(|turn| turn != id);
+                if job.inflight == 0 {
+                    self.jobs.remove(id);
+                }
+            }
+        }
+    }
+
+    fn host_due(&self, host: &str, now: Instant) -> Option<Instant> {
+        match self.hosts.get(host) {
+            Some(entry) if entry.inflight >= self.concurrency => None,
+            Some(entry) => Some(entry.next),
+            None => Some(now),
         }
     }
 
     pub fn due(&self) -> Option<Instant> {
-        self.ready.peek().map(|Reverse((at, _))| *at)
-    }
-
-    pub fn take(&mut self) -> Option<String> {
-        if self.due()? > Instant::now() {
-            return None;
-        }
-        let Reverse((_, host)) = self.ready.pop()?;
-        let entry = self.hosts.get_mut(&host)?;
-        entry.in_heap = false;
-        // A newly submitted crawl may have raised this host's spacing since it was enqueued.
-        if entry.next > Instant::now() {
-            self.push(&host);
-            return None;
-        }
-        entry.inflight += 1;
-        debug_assert!(entry.inflight <= self.concurrency);
         let now = Instant::now();
-        entry.last_started = Some(now);
-        entry.next = now + entry.spacing;
-        self.push(&host);
-        Some(host)
+        self.turns
+            .iter()
+            .filter_map(|id| {
+                let job = self.jobs.get(id)?;
+                let host_at = if job.hosts.is_empty() {
+                    now
+                } else {
+                    job.hosts
+                        .iter()
+                        .filter_map(|host| self.host_due(host, now))
+                        .min()?
+                };
+                Some(job.next_at.max(host_at))
+            })
+            .min()
     }
 
-    pub fn release(&mut self, host: &str, empty: bool) {
+    pub fn take(&mut self) -> Option<Next> {
+        let now = Instant::now();
+        self.hosts
+            .retain(|_, host| host.inflight != 0 || host.next > now);
+        for _ in 0..self.turns.len() {
+            let id = self.turns.pop_front()?;
+            self.turns.push_back(id.clone());
+            let job = self.jobs.get(&id)?;
+            if job.next_at > now {
+                continue;
+            }
+            if job.hosts.is_empty() {
+                return Some(Next::Refill {
+                    job: id,
+                    after: job.cursor.clone(),
+                });
+            }
+            let Some(index) = job
+                .hosts
+                .iter()
+                .position(|host| self.host_due(host, now).is_some_and(|at| at <= now))
+            else {
+                continue;
+            };
+            let job = self.jobs.get_mut(&id)?;
+            let host = job.hosts.remove(index)?;
+            job.next_at = now + job.delay;
+            job.inflight += 1;
+            let entry = self.hosts.entry(host.clone()).or_insert(Host {
+                inflight: 0,
+                next: now,
+            });
+            entry.inflight += 1;
+            entry.next = now + self.spacing;
+            return Some(Next::Lease { job: id, host });
+        }
+        None
+    }
+
+    pub fn release(&mut self, id: &str, host: &str) {
         if let Some(entry) = self.hosts.get_mut(host) {
             entry.inflight = entry.inflight.saturating_sub(1);
-            if empty {
-                entry.queued = false;
-            }
         }
-        self.push(host);
-        // A queued heap entry may need one final empty lease before it can be forgotten.
-        if self
-            .hosts
-            .get(host)
-            .is_some_and(|entry| !entry.queued && entry.inflight == 0 && !entry.in_heap)
-        {
-            self.hosts.remove(host);
+        if let Some(job) = self.jobs.get_mut(id) {
+            job.inflight = job.inflight.saturating_sub(1);
+        }
+    }
+
+    pub fn started(&mut self, id: &str, host: &str) {
+        let now = Instant::now();
+        if let Some(job) = self.jobs.get_mut(id) {
+            job.next_at = now + job.delay;
+        }
+        if let Some(entry) = self.hosts.get_mut(host) {
+            entry.next = now + self.spacing;
         }
     }
 }

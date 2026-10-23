@@ -17,12 +17,13 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/v1/map", post(map))
         .route("/v1/crawl", post(crawl_start))
         .route("/v1/crawl/{id}", get(crawl_status).delete(crawl_cancel))
-        .route("/v1/crawl/{id}/errors", get(errors))
+        .route("/v1/crawl/{id}/errors", get(crawl_errors))
         .route("/v1/batch/scrape", post(batch_start))
         .route(
             "/v1/batch/scrape/{id}",
             get(batch_status).delete(batch_cancel),
         )
+        .route("/v1/batch/scrape/{id}/errors", get(batch_errors))
 }
 
 impl From<JobError> for ApiError {
@@ -183,12 +184,12 @@ async fn crawl_start(
     )
     .map_err(ApiError::bad_request)?;
     let delay_ms = match body.delay {
-        Some(delay) if delay.is_finite() && (0.0..=3600.0).contains(&delay) => {
+        Some(delay) if delay.is_finite() && (0.0..=60.0).contains(&delay) => {
             Some((delay * 1000.0).ceil() as u64)
         }
         Some(_) => {
             return Err(ApiError::bad_request(
-                "delay must be between 0 and 3600 seconds",
+                "delay must be between 0 and 60 seconds",
             ));
         }
         None => None,
@@ -200,7 +201,7 @@ async fn crawl_start(
         scope: Some(scope),
         limit: body.limit.unwrap_or(10_000),
         delay_ms,
-        seed_host: seed.host_str().map(str::to_owned),
+        seed_origin: Some(seed.origin().ascii_serialization()),
     };
     let mut seeds = vec![Seed {
         url: seed.clone(),
@@ -291,7 +292,7 @@ async fn batch_start(
         scope: None,
         limit: seeds.len() as u32,
         delay_ms: None,
-        seed_host: None,
+        seed_origin: None,
     };
     let base = public_url(&state, &headers, "/v1/batch/scrape")?;
     let id = jobs(&state)?
@@ -384,30 +385,32 @@ async fn batch_status(
 ) -> Result<Json<Value>, ApiError> {
     status(state, headers, id, query, JobKind::Batch).await
 }
-async fn cancel(state: AppState, raw_id: String, kind: JobKind) -> Result<Json<Value>, ApiError> {
-    if !jobs(&state)?.cancel(id(&raw_id)?, kind).await? {
-        return Err(not_found());
+async fn cancel(state: AppState, raw_id: String, kind: JobKind) -> Result<Response, ApiError> {
+    match jobs(&state)?.cancel(id(&raw_id)?, kind).await? {
+        None => Err(not_found()),
+        Some(false) => Ok((
+            StatusCode::CONFLICT,
+            Json(json!({"error":"Crawl is already completed"})),
+        )
+            .into_response()),
+        Some(true) => Ok(Json(json!({"status":"cancelled"})).into_response()),
     }
-    Ok(Json(json!({"status":"cancelled"})))
 }
 async fn crawl_cancel(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     cancel(state, id, JobKind::Crawl).await
 }
 async fn batch_cancel(
     State(state): State<AppState>,
     Path(id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     cancel(state, id, JobKind::Batch).await
 }
-async fn errors(
-    State(state): State<AppState>,
-    Path(raw_id): Path<String>,
-) -> Result<Json<Value>, ApiError> {
+async fn errors(state: AppState, raw_id: String, kind: JobKind) -> Result<Json<Value>, ApiError> {
     let errors = jobs(&state)?
-        .errors(id(&raw_id)?)
+        .errors(id(&raw_id)?, kind)
         .await?
         .ok_or_else(not_found)?;
     let errors = errors
@@ -419,4 +422,18 @@ async fn errors(
         })
         .collect::<Result<Vec<_>, _>>()?;
     Ok(Json(json!({"errors":errors,"robotsBlocked":[]})))
+}
+
+async fn crawl_errors(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    errors(state, id, JobKind::Crawl).await
+}
+
+async fn batch_errors(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>, ApiError> {
+    errors(state, id, JobKind::Batch).await
 }

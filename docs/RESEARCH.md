@@ -15,7 +15,8 @@ vendor performance claims are not measured DripSonar results.
 4. **Tantivy for searching the evidence we own.** Build a lexical baseline before adding model
    ranking. Exa and Context.dev are useful references for live discovery and cited result design.
 
-These are candidates to evaluate, not dependencies selected or installed.
+These are candidates to evaluate, not dependencies selected or installed. The open repositories
+and hosted SDKs are now [pinned under references/](../references/README.md) for local inspection.
 
 ## Collection and extraction
 

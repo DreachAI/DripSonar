@@ -42,8 +42,9 @@ fixture payload, runtime state, or script source is copied in this bootstrap.
 
 Firecrawl is a pinned Git submodule at `references/firecrawl`, with its original license and
 notices intact. The Gitlink is the authoritative revision. Do not vendor its tree into DripSonar
-source or install its runtime as part of a reference update. Other projects are linked in research;
-add a local checkout only when a concrete investigation needs one.
+source or install its runtime as part of a reference update. The owner's follow-up requested the
+other research references too: their open repositories and hosted SDKs are pinned under `references/`.
+Do not initialize their nested submodules or install/build them as part of source inspection.
 
 No DripSonar distribution license has been selected. Record the source and license for any code
 copied or translated; Firecrawl's root AGPL license and per-directory exceptions must be considered

@@ -1,3 +1,39 @@
 [submodule "references/firecrawl"]
 	path = references/firecrawl
 	url = https://github.com/firecrawl/firecrawl.git
+[submodule "references/spider"]
+	path = references/spider
+	url = https://github.com/spider-rs/spider.git
+[submodule "references/trafilatura"]
+	path = references/trafilatura
+	url = https://github.com/adbar/trafilatura.git
+[submodule "references/crawl4ai"]
+	path = references/crawl4ai
+	url = https://github.com/unclecode/crawl4ai.git
+[submodule "references/tantivy"]
+	path = references/tantivy
+	url = https://github.com/quickwit-oss/tantivy.git
+[submodule "references/crawlee"]
+	path = references/crawlee
+	url = https://github.com/apify/crawlee.git
+[submodule "references/scrapling"]
+	path = references/scrapling
+	url = https://github.com/D4Vinci/Scrapling.git
+[submodule "references/docling"]
+	path = references/docling
+	url = https://github.com/docling-project/docling.git
+[submodule "references/jina-reader"]
+	path = references/jina-reader
+	url = https://github.com/jina-ai/reader.git
+[submodule "references/searxng"]
+	path = references/searxng
+	url = https://github.com/searxng/searxng.git
+[submodule "references/context7"]
+	path = references/context7
+	url = https://github.com/upstash/context7.git
+[submodule "references/exa-js"]
+	path = references/exa-js
+	url = https://github.com/exa-labs/exa-js.git
+[submodule "references/context-typescript-sdk"]
+	path = references/context-typescript-sdk
+	url = https://github.com/context-dot-dev/context-typescript-sdk.git

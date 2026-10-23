@@ -11,7 +11,7 @@ use std::{
     time::Duration,
 };
 
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
@@ -34,6 +34,11 @@ CREATE TABLE IF NOT EXISTS captures (
 CREATE INDEX IF NOT EXISTS captures_by_key ON captures (cache_key, fetched_at_ms);
 ";
 
+/// Idle read-only connections kept for reuse; bursts beyond this open short-lived extras.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+const IDLE_READERS: usize = 8;
+
 /// Response headers never persisted: they carry session credentials.
 const UNSTORED_HEADERS: [&str; 1] = ["set-cookie"];
 
@@ -49,9 +54,45 @@ pub enum StoreError {
     Task,
 }
 
+/// One writer connection plus reusable read-only connections, so cache lookups never queue
+/// behind an insert (WAL lets readers run beside the writer).
+struct Db {
+    path: PathBuf,
+    writer: Mutex<Connection>,
+    readers: Mutex<Vec<Connection>>,
+}
+
+impl Db {
+    fn reader(&self) -> Result<Connection, StoreError> {
+        let idle = self
+            .readers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .pop();
+        match idle {
+            Some(conn) => Ok(conn),
+            None => {
+                let conn = Connection::open_with_flags(
+                    &self.path,
+                    OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+                )?;
+                conn.busy_timeout(BUSY_TIMEOUT)?;
+                Ok(conn)
+            }
+        }
+    }
+
+    fn recycle(&self, conn: Connection) {
+        let mut idle = self.readers.lock().unwrap_or_else(PoisonError::into_inner);
+        if idle.len() < IDLE_READERS {
+            idle.push(conn);
+        }
+    }
+}
+
 #[derive(Clone)]
 pub struct Store {
-    db: Arc<Mutex<Connection>>,
+    db: Arc<Db>,
     blobs: PathBuf,
 }
 
@@ -59,24 +100,36 @@ impl Store {
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         let blobs = dir.join("blobs").join("sha256");
         fs::create_dir_all(&blobs)?;
-        let mut db = Connection::open(dir.join("sonar.db"))?;
-        db.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))?;
-        db.pragma_update(None, "foreign_keys", true)?;
-        db.busy_timeout(Duration::from_secs(5))?;
-        db.execute_batch(SCHEMA)?;
+        let path = dir.join("sonar.db");
+        let writer = Connection::open(&path)?;
+        writer.busy_timeout(BUSY_TIMEOUT)?;
+        writer
+            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))?;
+        // NORMAL is crash-safe in WAL: a power loss can drop the newest rows, never corrupt.
+        writer.pragma_update(None, "synchronous", "NORMAL")?;
+        writer.pragma_update(None, "foreign_keys", true)?;
+        writer.execute_batch(SCHEMA)?;
         // Serialize schema inspection and ALTER across simultaneous opens of an old store.
-        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let has_route: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('captures') WHERE name = 'route')",
-            [],
-            |row| row.get(0),
-        )?;
-        if !has_route {
-            tx.execute_batch("ALTER TABLE captures ADD COLUMN route TEXT")?;
-        }
-        tx.commit()?;
+        let writer = {
+            let mut writer = writer;
+            let tx = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let has_route: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('captures') WHERE name = 'route')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_route {
+                tx.execute_batch("ALTER TABLE captures ADD COLUMN route TEXT")?;
+            }
+            tx.commit()?;
+            writer
+        };
         Ok(Self {
-            db: Arc::new(Mutex::new(db)),
+            db: Arc::new(Db {
+                path,
+                writer: Mutex::new(writer),
+                readers: Mutex::new(Vec::new()),
+            }),
             blobs,
         })
     }
@@ -106,30 +159,37 @@ impl Store {
         let max_age_ms = i64::try_from(max_age.as_millis()).unwrap_or(i64::MAX);
         let since = unix_ms(OffsetDateTime::now_utc())?.saturating_sub(max_age_ms);
         let row = {
-            let db = self.db.lock().unwrap_or_else(PoisonError::into_inner);
-            db.query_row(
-                "SELECT requested_url, final_url, status, headers, content_type, blob_sha256,
+            let db = self.db.reader()?;
+            let row = db
+                .query_row(
+                    "SELECT requested_url, final_url, status, headers, content_type, blob_sha256,
                         fetched_at_ms, route
                  FROM captures
                  WHERE cache_key = ?1 AND fetched_at_ms >= ?2 AND status BETWEEN 200 AND 299
                  ORDER BY fetched_at_ms DESC, id DESC LIMIT 1",
-                params![key, since],
-                |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, String>(1)?,
-                        row.get::<_, u16>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, String>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, Option<String>>(7)?,
-                    ))
-                },
-            )
-            .optional()?
+                    params![key, since],
+                    |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, u16>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, Option<String>>(4)?,
+                            row.get::<_, String>(5)?,
+                            row.get::<_, i64>(6)?,
+                            row.get::<_, Option<String>>(7)?,
+                        ))
+                    },
+                )
+                .optional();
+            // Only a connection that just answered is worth reusing.
+            if row.is_ok() {
+                self.db.recycle(db);
+            }
+            row?
         };
-        let Some((requested, final_url, status, headers, content_type, hash, fetched_at, route)) = row
+        let Some((requested, final_url, status, headers, content_type, hash, fetched_at, route)) =
+            row
         else {
             return Ok(None);
         };
@@ -170,7 +230,11 @@ impl Store {
             })
             .collect();
         let headers = serde_json::to_string(&headers).map_err(|_| StoreError::Corrupt)?;
-        let db = self.db.lock().unwrap_or_else(PoisonError::into_inner);
+        let db = self
+            .db
+            .writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         db.execute(
             "INSERT INTO captures (cache_key, requested_url, final_url, status, headers,
                                    content_type, blob_sha256, byte_len, fetched_at_ms, route)

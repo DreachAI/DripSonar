@@ -169,6 +169,7 @@ impl AppState {
         }
         let request = ScrapeRequest {
             url: opts.url.clone().unwrap_or_default(),
+            proxy: opts._proxy.unwrap_or_default(),
             headers: opts.headers.clone().into_iter().collect(),
             deadline: Instant::now() + timeout,
             max_age: Duration::from_millis(opts.max_age.unwrap_or(self.default_max_age_ms)),
@@ -364,14 +365,14 @@ struct ScrapeOptions {
     max_age: Option<u64>,
     #[serde(rename = "parsePDF")]
     parse_pdf: Option<bool>,
-    // Accepted no-ops: a fixed desktop viewport, no ad blocker or proxy choice; captures are
+    // Accepted no-ops: a fixed desktop viewport and no ad blocker; captures are
     // always stored.
     #[serde(rename = "mobile")]
     _mobile: Option<bool>,
     #[serde(rename = "blockAds")]
     _block_ads: Option<bool>,
     #[serde(rename = "proxy")]
-    _proxy: Option<String>,
+    _proxy: Option<crate::scrape::ProxyMode>,
     #[serde(rename = "storeInCache")]
     _store_in_cache: Option<bool>,
     #[serde(rename = "origin")]

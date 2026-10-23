@@ -66,6 +66,9 @@ pub struct Config {
     pub proxy_hosts: Vec<String>,
     #[arg(long, env = "SONAR_PROXY_MAX_BYTES_PER_DAY")]
     pub proxy_max_bytes_per_day: Option<u64>,
+    /// Retry blocked GET pages through the proxy and browser tiers.
+    #[arg(long, env = "SONAR_BLOCK_RECOVERY", default_value_t = true, action = clap::ArgAction::Set)]
+    pub block_recovery: bool,
     #[arg(long, env = "SONAR_FORWARD_PROXY_CONCURRENCY", default_value_t = 32, value_parser = at_least_one())]
     pub forward_proxy_concurrency: usize,
     #[arg(long, env = "SONAR_FORWARD_PROXY_IDLE_TIMEOUT_MS", default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(1..=86_400_000))]

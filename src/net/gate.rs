@@ -16,6 +16,8 @@ use crate::config::Config;
 
 /// Above this many tracked hosts, idle entries are dropped.
 const MAX_TRACKED_HOSTS: usize = 1024;
+const MAX_BACKOFF: Duration = Duration::from_secs(30);
+const BACKOFF_TTL: Duration = Duration::from_secs(600);
 
 pub(super) struct Gate {
     global: Arc<Semaphore>,
@@ -26,7 +28,13 @@ pub(super) struct Gate {
 
 struct HostSlot {
     permits: Arc<Semaphore>,
-    next_start: Mutex<Instant>,
+    timing: Mutex<Timing>,
+}
+
+struct Timing {
+    next_start: Instant,
+    spacing: Duration,
+    penalized_until: Instant,
 }
 
 /// Held while one request and its body are in flight. Holding the slot keeps it tracked, so
@@ -59,19 +67,27 @@ impl Gate {
             .await
             .map_err(|_| FetchError::Overloaded)?
             .map_err(|_| FetchError::Protocol)?;
-        let start = {
-            let mut next = slot
-                .next_start
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let start = (*next).max(Instant::now());
-            if start > deadline {
+        loop {
+            let start = {
+                let mut timing = slot.timing.lock().unwrap_or_else(PoisonError::into_inner);
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(FetchError::Timeout);
+                }
+                if timing.penalized_until <= now {
+                    timing.spacing = self.spacing;
+                }
+                if timing.next_start <= now {
+                    timing.next_start = now + timing.spacing;
+                    break;
+                }
+                timing.next_start
+            };
+            if start >= deadline {
                 return Err(FetchError::Timeout);
             }
-            *next = start + self.spacing;
-            start
-        };
-        sleep_until(start).await;
+            sleep_until(start).await;
+        }
         Ok(Pass {
             _host: host_permit,
             _slot: slot,
@@ -79,22 +95,53 @@ impl Gate {
         })
     }
 
+    /// Response feedback uses the same host entry as all interactive and job fetches.
+    pub(super) fn penalize(&self, host: &str, retry_after: Option<Duration>) {
+        let slot = self.slot(host);
+        let mut timing = slot.timing.lock().unwrap_or_else(PoisonError::into_inner);
+        let now = Instant::now();
+        if timing.penalized_until <= now {
+            timing.spacing = self.spacing;
+        }
+        timing.spacing = timing
+            .spacing
+            .max(Duration::from_millis(1))
+            .saturating_mul(2)
+            .max(retry_after.unwrap_or_default())
+            .min(MAX_BACKOFF)
+            .max(self.spacing);
+        timing.penalized_until = now + BACKOFF_TTL;
+        timing.next_start = timing.next_start.max(now + timing.spacing);
+    }
+
+    pub(super) fn reward(&self, host: &str) {
+        let slot = self.slot(host);
+        let mut timing = slot.timing.lock().unwrap_or_else(PoisonError::into_inner);
+        timing.spacing = (timing.spacing / 2).max(self.spacing);
+    }
+
     fn slot(&self, host: &str) -> Arc<HostSlot> {
         let mut hosts = self.hosts.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(slot) = hosts.get(host) {
+            return Arc::clone(slot);
+        }
         if hosts.len() >= MAX_TRACKED_HOSTS {
             let now = Instant::now();
             hosts.retain(|_, slot| {
-                let next = *slot
-                    .next_start
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner);
-                Arc::strong_count(slot) > 1 || next > now
+                let timing = slot.timing.lock().unwrap_or_else(PoisonError::into_inner);
+                Arc::strong_count(slot) > 1
+                    || timing.next_start > now
+                    || timing.penalized_until > now
             });
         }
         let slot = hosts.entry(host.to_owned()).or_insert_with(|| {
             Arc::new(HostSlot {
                 permits: Arc::new(Semaphore::new(self.per_host)),
-                next_start: Mutex::new(Instant::now()),
+                timing: Mutex::new(Timing {
+                    next_start: Instant::now(),
+                    spacing: self.spacing,
+                    penalized_until: Instant::now(),
+                }),
             })
         });
         Arc::clone(slot)

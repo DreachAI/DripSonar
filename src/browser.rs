@@ -119,6 +119,20 @@ impl BrowserTier {
             tracing::error!(%error, port = proxy_port, "browser forward proxy failed to start");
             BrowserError::Unavailable("forward proxy failed to start")
         })?;
+        // A separate listener fixes the route for an isolated Chrome context, including
+        // workers and subframes, without changing routing for any concurrent visit.
+        let (proxy_override, proxy_override_task) = if routes.has_proxy() {
+            let (address, token, task) =
+                ForwardProxy::start(0, fetcher.guard(), routes.proxy_only())
+                    .await
+                    .map_err(|_| {
+                        proxy_task.abort();
+                        BrowserError::Unavailable("proxy override failed to start")
+                    })?;
+            (Some((address, token)), Some(task))
+        } else {
+            (None, None)
+        };
         let mut base = cfg
             .public_url
             .clone()
@@ -139,6 +153,7 @@ impl BrowserTier {
             user_agent: cfg.user_agent.clone(),
             proxy,
             token,
+            proxy_override,
         });
         let sessions = cfg.browser_sessions.min(cfg.browser_tabs.saturating_sub(1));
         let tier = Arc::new_cyclic(|weak: &Weak<Tier>| Tier {
@@ -151,7 +166,10 @@ impl BrowserTier {
             sessions: Sessions::new(sessions),
             user_agent: cfg.user_agent.clone(),
             max_bytes: cfg.max_body_bytes,
-            tasks: vec![proxy_task, spawn_reaper(weak.clone())],
+            tasks: std::iter::once(proxy_task)
+                .chain(proxy_override_task)
+                .chain(std::iter::once(spawn_reaper(weak.clone())))
+                .collect(),
         });
         tracing::info!(
             launched,
@@ -185,17 +203,38 @@ impl BrowserTier {
         deadline: Instant,
         plan: &BrowserPlan,
     ) -> Result<BrowserOutput, BrowserError> {
+        self.render_with_proxy(url, headers, deadline, plan, false)
+            .await
+    }
+
+    /// The override is per context, never a process-wide proxy setting.
+    pub(crate) async fn render_with_proxy(
+        &self,
+        url: &Url,
+        headers: &[(String, String)],
+        deadline: Instant,
+        plan: &BrowserPlan,
+        force_proxy: bool,
+    ) -> Result<BrowserOutput, BrowserError> {
         let tier = self.tier()?;
+        if force_proxy && !tier.routes.has_proxy() {
+            return Err(FetchError::Refused("proxy not configured".into()).into());
+        }
         within(deadline, async {
             let _admission = tier.fetcher.admit(url, deadline).await?;
             let policy = TabPolicy {
                 origin: url.origin(),
                 headers: headers.to_vec(),
                 block_assets: !plan.is_visual(),
+                proxy_route: force_proxy,
             };
             let tab = tier.pool.lease(policy, deadline, true).await?;
             actions::navigate(&tab.page, url, deadline).await?;
-            tier.visit(&tab, url, plan, deadline).await
+            let mut output = tier.visit(&tab, url, plan, deadline).await?;
+            if force_proxy {
+                output.capture.route = Route::Proxy;
+            }
+            Ok(output)
         })
         .await
     }
@@ -207,16 +246,34 @@ impl BrowserTier {
         headers: &[(String, String)],
         plan: &BrowserPlan,
     ) -> String {
+        self.rendered_key_with_proxy(url, headers, plan, false)
+    }
+
+    pub(crate) fn rendered_key_with_proxy(
+        &self,
+        url: &Url,
+        headers: &[(String, String)],
+        plan: &BrowserPlan,
+        force_proxy: bool,
+    ) -> String {
         let user_agent = self.0.as_ref().map_or("", |tier| tier.user_agent.as_str());
-        let route = self.0.as_ref().map_or(Route::Direct, |tier| {
-            tier.routes.route_for(url.host_str().unwrap_or_default())
-        });
+        let route = if force_proxy {
+            Route::Proxy
+        } else {
+            self.0.as_ref().map_or(Route::Direct, |tier| {
+                tier.routes.route_for(url.host_str().unwrap_or_default())
+            })
+        };
         let route = route.as_str();
         let assets = if plan.is_visual() { "visual" } else { "text" };
         let (width, height) = pool::VIEWPORT;
         let mut material = format!(
             "browser\n{RENDER_POLICY_VERSION}\n{user_agent}\n{width}x{height}\n{assets}\n{route}\n{url}"
         );
+        if force_proxy {
+            // Host-routed visits may redirect to a direct host; forced visits cannot.
+            material.push_str("\noverride:proxy");
+        }
         for (name, value) in headers {
             material.push_str(&format!("\n{name}: {value}"));
         }
@@ -257,6 +314,7 @@ impl BrowserTier {
                 origin: url.origin(),
                 headers: Vec::new(),
                 block_assets: false,
+                proxy_route: false,
             };
             let tab = tier.pool.lease(policy, deadline, false).await?;
             actions::navigate(&tab.page, url, deadline).await?;

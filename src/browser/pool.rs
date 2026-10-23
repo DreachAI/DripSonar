@@ -66,6 +66,7 @@ pub(super) struct PoolConfig {
     pub user_agent: String,
     pub proxy: SocketAddr,
     pub token: String,
+    pub proxy_override: Option<(SocketAddr, String)>,
 }
 
 pub(super) struct Pool {
@@ -255,6 +256,16 @@ impl Pool {
         deadline: Instant,
         one_shot: bool,
     ) -> Result<Tab, BrowserError> {
+        let proxy_server = if policy.proxy_route {
+            let (address, _) = self
+                .cfg
+                .proxy_override
+                .as_ref()
+                .ok_or(BrowserError::Unavailable("proxy not configured"))?;
+            Some(format!("http://{address}"))
+        } else {
+            None
+        };
         let slot = {
             let _queued = Arc::clone(&self.queue)
                 .try_acquire_owned()
@@ -285,6 +296,8 @@ impl Pool {
         let created = command(deadline, async {
             let params = CreateBrowserContextParams {
                 dispose_on_detach: Some(true),
+                proxy_bypass_list: proxy_server.as_ref().map(|_| "<-loopback>".to_owned()),
+                proxy_server,
                 ..CreateBrowserContextParams::default()
             };
             Ok(browser.read().await.create_browser_context(params).await)
@@ -433,10 +446,14 @@ impl Pool {
             .get_mut_child()
             .and_then(|child| child.as_mut_inner().id());
         let external = user_data_dir.is_none();
-        let proxy_origin = format!("http://{}", self.cfg.proxy);
+        let mut proxy_credentials =
+            HashMap::from([(format!("http://{}", self.cfg.proxy), self.cfg.token.clone())]);
+        if let Some((address, token)) = &self.cfg.proxy_override {
+            proxy_credentials.insert(format!("http://{address}"), token.clone());
+        }
         let instance = Arc::new(Instance {
             browser: Arc::new(RwLock::new(browser)),
-            net: Arc::new(Interceptor::new(proxy_origin, self.cfg.token.clone())),
+            net: Arc::new(Interceptor::new(proxy_credentials)),
             handler: std::sync::Mutex::default(),
             tasks: std::sync::Mutex::default(),
             user_data_dir,

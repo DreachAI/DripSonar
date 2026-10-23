@@ -177,12 +177,28 @@ impl Fetcher {
 
     /// One guarded exchange; `target.deadline` covers queueing, redirects, retries, and body.
     pub async fn fetch(&self, target: &Target) -> Result<Fetched, FetchError> {
-        timeout_at(target.deadline, self.follow(target))
+        self.fetch_with_route(target, None).await
+    }
+
+    /// A request-local override applies to redirects too, without changing host routing.
+    pub async fn fetch_with_route(
+        &self,
+        target: &Target,
+        route: Option<Route>,
+    ) -> Result<Fetched, FetchError> {
+        if route == Some(Route::Proxy) && self.proxy_client.is_none() {
+            return Err(FetchError::Refused("proxy not configured".into()));
+        }
+        timeout_at(target.deadline, self.follow(target, route))
             .await
             .unwrap_or(Err(FetchError::Timeout))
     }
 
-    async fn follow(&self, target: &Target) -> Result<Fetched, FetchError> {
+    async fn follow(
+        &self,
+        target: &Target,
+        override_route: Option<Route>,
+    ) -> Result<Fetched, FetchError> {
         let mut url = target.url.clone();
         for _ in 0..=MAX_REDIRECTS {
             self.guard
@@ -194,7 +210,8 @@ impl Fetcher {
             } else {
                 &[]
             };
-            let route = self.routes.route_for(url.host_str().unwrap_or_default());
+            let route = override_route
+                .unwrap_or_else(|| self.routes.route_for(url.host_str().unwrap_or_default()));
             let (response, pass) = self.send(&url, headers, target.deadline, route).await?;
             match redirect_location(&response) {
                 Some(location) => url = next_hop(&url, location)?,
@@ -230,7 +247,21 @@ impl Fetcher {
             }
             match request.send().await {
                 Ok(response) => {
-                    if !retried_status && let Some(wait) = retry_after(&response, deadline) {
+                    let retry_after = retry_after(&response);
+                    if matches!(response.status().as_u16(), 429 | 503)
+                        || response
+                            .headers()
+                            .contains_key(reqwest::header::RETRY_AFTER)
+                    {
+                        self.gate.penalize(host, retry_after);
+                    } else if response.status().is_success() {
+                        self.gate.reward(host);
+                    }
+                    if !retried_status
+                        && matches!(response.status().as_u16(), 429 | 503)
+                        && let Some(wait) = retry_after
+                        && wait < deadline.saturating_duration_since(Instant::now())
+                    {
                         retried_status = true;
                         drop((response, pass));
                         sleep(wait).await;
@@ -266,15 +297,19 @@ fn next_hop(from: &Url, location: &str) -> Result<Url, FetchError> {
     Ok(next)
 }
 
-fn retry_after(response: &reqwest::Response, deadline: Instant) -> Option<Duration> {
-    if !matches!(response.status().as_u16(), 429 | 503) {
-        return None;
-    }
-    // shortcut: delta-seconds only; an HTTP-date Retry-After is returned as observed.
+fn retry_after(response: &reqwest::Response) -> Option<Duration> {
     let value = response.headers().get(reqwest::header::RETRY_AFTER)?;
-    let wait = Duration::from_secs(value.to_str().ok()?.trim().parse().ok()?);
-    // Compared, never added, so an absurd value cannot overflow the clock.
-    (wait < deadline.saturating_duration_since(Instant::now())).then_some(wait)
+    let value = value.to_str().ok()?.trim();
+    if let Ok(seconds) = value.parse() {
+        return Some(Duration::from_secs(seconds));
+    }
+    let at =
+        time::OffsetDateTime::parse(value, &time::format_description::well_known::Rfc2822).ok()?;
+    Some(
+        (at - time::OffsetDateTime::now_utc())
+            .try_into()
+            .unwrap_or_default(),
+    )
 }
 
 /// Reads the body, refusing it once its decoded size passes `target.max_bytes`.

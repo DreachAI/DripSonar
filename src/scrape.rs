@@ -30,6 +30,22 @@ pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 
 static RENDER_SLOTS: OnceLock<Semaphore> = OnceLock::new();
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ProxyMode {
+    Basic,
+    #[default]
+    Auto,
+    #[serde(alias = "enhanced")]
+    Stealth,
+}
+
+impl ProxyMode {
+    fn route(self) -> Option<Route> {
+        (self == Self::Stealth).then_some(Route::Proxy)
+    }
+}
+
 /// Set the process-wide CPU budget before rendering starts, including CLI exports.
 pub fn configure_rendering(threads: usize) {
     RENDER_SLOTS.get_or_init(|| Semaphore::new(threads.clamp(1, Semaphore::MAX_PERMITS)));
@@ -38,6 +54,7 @@ pub fn configure_rendering(threads: usize) {
 #[derive(Clone, Debug)]
 pub struct ScrapeRequest {
     pub url: String,
+    pub proxy: ProxyMode,
     pub headers: Vec<(String, String)>,
     pub deadline: Instant,
     /// Newest acceptable cached capture; zero always fetches.
@@ -82,6 +99,8 @@ mod stored_route {
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 pub struct ScrapeTemplate {
+    #[serde(default)]
+    pub proxy: ProxyMode,
     pub headers: Vec<(String, String)>,
     pub timeout_ms: u64,
     pub max_age_ms: u64,
@@ -93,6 +112,7 @@ impl ScrapeTemplate {
     pub fn request(&self, url: &Url) -> ScrapeRequest {
         ScrapeRequest {
             url: url.to_string(),
+            proxy: self.proxy,
             headers: self.headers.clone(),
             deadline: Instant::now() + Duration::from_millis(self.timeout_ms),
             max_age: Duration::from_millis(self.max_age_ms),
@@ -105,6 +125,7 @@ impl ScrapeTemplate {
 impl From<&ScrapeRequest> for ScrapeTemplate {
     fn from(req: &ScrapeRequest) -> Self {
         Self {
+            proxy: req.proxy,
             headers: req.headers.clone(),
             timeout_ms: req
                 .deadline
@@ -207,6 +228,7 @@ pub struct Scraper {
     inflight: Flights,
     browser: BrowserTier,
     rendering: Flights,
+    block_recovery: bool,
 }
 
 impl Scraper {
@@ -219,6 +241,7 @@ impl Scraper {
             inflight: Arc::default(),
             browser: BrowserTier::default(),
             rendering: Arc::default(),
+            block_recovery: cfg.block_recovery,
         }
     }
 
@@ -256,11 +279,14 @@ impl Scraper {
         // fetch itself carries on for other waiters.
         let mut request = req.clone();
         let mut refetched = false;
-        let (prepared, served) = loop {
-            let (fetched, id, served) =
-                timeout_at(req.deadline, self.fetch_http(&url, &headers, &request))
-                    .await
-                    .map_err(|_| FetchError::Timeout)??;
+        let (result, served, status) = loop {
+            let (fetched, id, served) = timeout_at(
+                req.deadline,
+                self.fetch_http(&url, &headers, &request, req.proxy.route()),
+            )
+            .await
+            .map_err(|_| FetchError::Timeout)??;
+            let status = fetched.status;
             match render_stored(
                 fetched,
                 id,
@@ -276,9 +302,16 @@ impl Scraper {
                     request.max_age = Duration::ZERO;
                     headers.retain(|(name, _)| !VALIDATORS.contains(&name.as_str()));
                 }
-                result => break (result?, served),
+                result => break (result, served, status),
             }
         };
+        if self.block_recovery
+            && req.proxy != ProxyMode::Stealth
+            && (matches!(status, 401 | 403 | 429) || matches!(result, Err(ScrapeError::Blocked)))
+        {
+            return self.recover(&url, &headers, req, result).await;
+        }
+        let prepared = result?;
         if self.browser.is_enabled()
             && let Escalation::Render { visible } = prepared.escalation
             && let Some(doc) = self.render_auto(&url, &headers, req, Some(visible)).await?
@@ -301,10 +334,11 @@ impl Scraper {
         url: &Url,
         headers: &[(String, String)],
         req: &ScrapeRequest,
+        route: Option<Route>,
     ) -> Result<(Fetched, i64, Served), ScrapeError> {
-        let key = http_key(url, headers);
+        let key = routed_http_key(url, headers, route);
         let capture = self
-            .cached_or_fetched(key.clone(), url, headers, req)
+            .cached_or_fetched(key.clone(), url, headers, req, route)
             .await?;
         if capture.0.status != 304 {
             return Ok(capture);
@@ -326,8 +360,8 @@ impl Scraper {
             .filter(|(name, _)| !VALIDATORS.contains(&name.as_str()))
             .cloned()
             .collect();
-        let key = http_key(url, &plain);
-        let capture = self.cached_or_fetched(key, url, &plain, req).await?;
+        let key = routed_http_key(url, &plain, route);
+        let capture = self.cached_or_fetched(key, url, &plain, req, route).await?;
         if capture.0.status == 304 {
             return Err(FetchError::Protocol.into());
         }
@@ -341,6 +375,7 @@ impl Scraper {
         url: &Url,
         headers: &[(String, String)],
         req: &ScrapeRequest,
+        route: Option<Route>,
     ) -> Result<(Fetched, i64, Served), ScrapeError> {
         if !req.max_age.is_zero() {
             match self.store.cached_capture(&key, req.max_age).await {
@@ -357,12 +392,77 @@ impl Scraper {
         };
         let (fetcher, store, flight_key) = (self.fetcher.clone(), self.store.clone(), key.clone());
         let work = async move {
-            let fetched = fetcher.fetch(&target).await.map_err(FlightError::Fetch)?;
+            let fetched = fetcher
+                .fetch_with_route(&target, route)
+                .await
+                .map_err(FlightError::Fetch)?;
             let id = store.put(&flight_key, &fetched).await.map_err(not_stored)?;
             Ok((fetched, id))
         };
         let (fetched, id) = share(&self.inflight, key, work).await?;
         Ok((fetched, id, Served::Fetched))
+    }
+
+    /// At most one proxy fetch and one browser visit; actions never enter this path.
+    async fn recover(
+        &self,
+        url: &Url,
+        headers: &[(String, String)],
+        req: &ScrapeRequest,
+        original: Result<Prepared, ScrapeError>,
+    ) -> Result<Document, ScrapeError> {
+        let mut recovery = Vec::new();
+        let mut latest = original.map(|prepared| prepared.doc);
+        let mut request = req.clone();
+        request.max_age = Duration::ZERO;
+        let headers: Vec<_> = headers
+            .iter()
+            .filter(|(name, _)| !VALIDATORS.contains(&name.as_str()))
+            .cloned()
+            .collect();
+        if req.proxy == ProxyMode::Auto && self.fetcher.route_config().has_proxy() {
+            recovery.push("proxy");
+            request.proxy = ProxyMode::Stealth;
+            let retried = timeout_at(req.deadline, async {
+                let (fetched, id, _) = self
+                    .fetch_http(url, &headers, &request, Some(Route::Proxy))
+                    .await?;
+                render_stored(fetched, id, &request, false, self.browser.is_enabled()).await
+            })
+            .await
+            .map_err(|_| FetchError::Timeout)?;
+            match retried {
+                Ok(prepared) => {
+                    let blocked = matches!(prepared.doc.status, 401 | 403 | 429);
+                    latest = Ok(prepared.doc);
+                    if !blocked {
+                        return recovered(latest, &recovery);
+                    }
+                }
+                Err(error @ (ScrapeError::Storage | ScrapeError::Fetch(FetchError::Timeout))) => {
+                    return Err(error);
+                }
+                Err(ScrapeError::Blocked) => latest = Err(ScrapeError::Blocked),
+                Err(_) => {}
+            }
+        }
+        if self.browser.is_enabled() {
+            recovery.push("browser");
+            match self
+                .render_explicit(url, &headers, &request, &BrowserPlan::default())
+                .await
+            {
+                Ok(doc) => latest = Ok(doc),
+                Err(
+                    error @ (ScrapeError::Storage
+                    | ScrapeError::Fetch(FetchError::Timeout)
+                    | ScrapeError::Browser(BrowserError::Fetch(FetchError::Timeout))),
+                ) => return Err(error),
+                Err(ScrapeError::Blocked) => latest = Err(ScrapeError::Blocked),
+                Err(_) => {}
+            }
+        }
+        recovered(latest, &recovery)
     }
 
     /// A caller-driven visit. Captures with actions are stored for the record under a key no
@@ -376,10 +476,21 @@ impl Scraper {
     ) -> Result<Document, ScrapeError> {
         let output = self
             .browser
-            .render(url, headers, req.deadline, plan)
+            .render_with_proxy(
+                url,
+                headers,
+                req.deadline,
+                plan,
+                req.proxy == ProxyMode::Stealth,
+            )
             .await?;
         let key = if plan.actions.is_empty() {
-            self.browser.rendered_key(url, headers, plan)
+            self.browser.rendered_key_with_proxy(
+                url,
+                headers,
+                plan,
+                req.proxy == ProxyMode::Stealth,
+            )
         } else {
             store::sha256_hex(format!("actions\n{}", uuid::Uuid::new_v4()).as_bytes())
         };
@@ -406,9 +517,12 @@ impl Scraper {
         http_visible: Option<usize>,
     ) -> Result<Option<Document>, ScrapeError> {
         let origin = url.origin().ascii_serialization();
-        let key = self
-            .browser
-            .rendered_key(url, headers, &BrowserPlan::default());
+        let key = self.browser.rendered_key_with_proxy(
+            url,
+            headers,
+            &BrowserPlan::default(),
+            req.proxy == ProxyMode::Stealth,
+        );
         let capture = timeout_at(req.deadline, async {
             if !req.max_age.is_zero()
                 && let Ok(Some(capture)) = self.store.cached_capture(&key, req.max_age).await
@@ -422,9 +536,16 @@ impl Scraper {
             let (browser, store, flight_key) =
                 (self.browser.clone(), self.store.clone(), key.clone());
             let (url, headers, deadline) = (url.clone(), headers.to_vec(), req.deadline);
+            let force_proxy = req.proxy == ProxyMode::Stealth;
             let work = async move {
                 let output = browser
-                    .render(&url, &headers, deadline, &BrowserPlan::default())
+                    .render_with_proxy(
+                        &url,
+                        &headers,
+                        deadline,
+                        &BrowserPlan::default(),
+                        force_proxy,
+                    )
                     .await
                     .map_err(FlightError::Browser)?;
                 let id = timeout_at(deadline, store.put_rendered(&flight_key, &output.capture))
@@ -506,6 +627,26 @@ fn http_key(url: &Url, headers: &[(String, String)]) -> String {
         material.push_str(&format!("\n{name}: {value}"));
     }
     store::sha256_hex(material.as_bytes())
+}
+
+fn routed_http_key(url: &Url, headers: &[(String, String)], route: Option<Route>) -> String {
+    let key = http_key(url, headers);
+    match route {
+        Some(route) => store::sha256_hex(format!("{key}\nroute:{}", route.as_str()).as_bytes()),
+        None => key,
+    }
+}
+
+fn recovered(
+    result: Result<Document, ScrapeError>,
+    recovery: &[&str],
+) -> Result<Document, ScrapeError> {
+    let mut doc = result?;
+    doc.rendered
+        .metadata
+        .extra
+        .insert("recovery".into(), serde_json::json!(recovery));
+    Ok(doc)
 }
 
 /// Missing scheme gets `http://`, as Firecrawl does; the fragment never reaches the server.

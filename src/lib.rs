@@ -39,6 +39,7 @@ pub(crate) mod testkit {
             proxy: None,
             proxy_hosts: Vec::new(),
             proxy_max_bytes_per_day: None,
+            block_recovery: true,
             forward_proxy_concurrency: 4,
             forward_proxy_idle_timeout_ms: 30_000,
             max_body_bytes: 1000,

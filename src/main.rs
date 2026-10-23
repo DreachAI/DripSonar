@@ -129,6 +129,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
             let scraper = Scraper::new(fetcher, store, &cfg).with_browser(browser.clone());
             let request = ScrapeRequest {
                 url,
+                proxy: Default::default(),
                 headers: Vec::new(),
                 deadline: Instant::now() + scrape::DEFAULT_TIMEOUT,
                 max_age: Duration::from_millis(cfg.default_max_age_ms),

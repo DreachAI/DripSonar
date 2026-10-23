@@ -13,7 +13,7 @@ use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, uri::Authority};
 use tokio::{
     io::{AsyncBufReadExt, AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, BufReader, ReadBuf},
     net::{TcpListener, TcpStream},
-    sync::{Semaphore, watch},
+    sync::watch,
     task::{JoinHandle, JoinSet},
     time::{Instant, timeout, timeout_at},
 };
@@ -38,7 +38,7 @@ impl ForwardProxy {
         let addr = listener.local_addr()?;
         let token = uuid::Uuid::new_v4().simple().to_string();
         let authorization = format!("Basic {}", base64(format!("sonar:{token}").as_bytes()));
-        let slots = Arc::new(Semaphore::new(route_cfg.concurrency));
+        let slots = Arc::clone(&route_cfg.slots);
         let task = tokio::spawn(async move {
             let mut connections = JoinSet::new();
             loop {

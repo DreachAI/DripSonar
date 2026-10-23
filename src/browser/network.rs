@@ -62,6 +62,7 @@ pub(super) struct TabPolicy {
     pub headers: Vec<(String, String)>,
     /// Text-only visits refuse images, fonts, and media.
     pub block_assets: bool,
+    pub proxy_route: bool,
 }
 
 pub(super) struct TabNet {
@@ -207,8 +208,7 @@ enum Reply {
 }
 
 pub(super) struct Interceptor {
-    proxy_origin: String,
-    token: String,
+    proxy_credentials: HashMap<String, String>,
     /// Keyed by target ID, which is also the tab's main frame ID.
     tabs: Mutex<HashMap<String, Arc<TabNet>>>,
     visual_tabs: AtomicUsize,
@@ -216,10 +216,9 @@ pub(super) struct Interceptor {
 }
 
 impl Interceptor {
-    pub(super) fn new(proxy_origin: String, token: String) -> Self {
+    pub(super) fn new(proxy_credentials: HashMap<String, String>) -> Self {
         Self {
-            proxy_origin,
-            token,
+            proxy_credentials,
             tabs: Mutex::default(),
             visual_tabs: AtomicUsize::new(0),
             auth_attempts: Mutex::default(),
@@ -371,7 +370,7 @@ impl Interceptor {
     fn on_auth(&self, event: &EventAuthRequired) -> Reply {
         let challenge = &event.auth_challenge;
         let ours = challenge.source == Some(AuthChallengeSource::Proxy)
-            && challenge.origin == self.proxy_origin
+            && self.proxy_credentials.contains_key(&challenge.origin)
             && {
                 let mut attempts = self
                     .auth_attempts
@@ -386,7 +385,7 @@ impl Interceptor {
             AuthChallengeResponse {
                 response: AuthChallengeResponseResponse::ProvideCredentials,
                 username: Some("sonar".into()),
-                password: Some(self.token.clone()),
+                password: self.proxy_credentials.get(&challenge.origin).cloned(),
             }
         } else {
             AuthChallengeResponse::new(AuthChallengeResponseResponse::CancelAuth)

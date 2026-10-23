@@ -148,7 +148,7 @@ for blocks, otherwise the Firecrawl code) with `error`.
   browser session and artifact routes (Browser tier below).
 - Request bodies deny unknown fields and are capped at 1 MiB. Fields Firecrawl accepts but this
   engine does not implement (`extract` format, `location`) are rejected with `BAD_REQUEST`
-  naming the field rather than silently ignored; `mobile`, `blockAds`, `proxy`, and `storeInCache`
+  naming the field rather than silently ignored; `mobile`, `blockAds`, and `storeInCache`
   are accepted as no-ops. `actions`, screenshot formats, and `waitFor` use the browser tier.
 - Auth: when `SONAR_API_KEY` is set, `Authorization: Bearer <key>` is required; otherwise keyless,
   like self-hosted Firecrawl.
@@ -274,6 +274,16 @@ type leaves `browser`.
   10 s; a Chrome restart ends them.
 
 ### Egress and proxy route (`egress`)
+
+Blocked GET pages (challenge interstitials or status 401/403/429) recover once through SOCKS5,
+then once through the browser if still blocked, under the original deadline. `proxy: auto`
+(default) enables this; `basic` skips proxy recovery, while `stealth`/`enhanced` pins the proxy
+route from the start and disables recovery. `SONAR_BLOCK_RECOVERY=false` disables automatic
+block recovery. Proxy recovery ignores `SONAR_PROXY_HOSTS`; browser recovery keeps that override
+in its isolated context through the guarded forward proxy. Route-specific caches stay separate;
+returned metadata records attempted stages in `recovery` and the final capture's `proxyUsed`.
+Host 429/503 responses or `Retry-After` double shared network spacing up to 30 seconds for ten
+minutes (never below configured spacing); successful 2xx responses halve it toward the baseline.
 
 - Upstream residential proxy: `SONAR_PROXY=socks5://user:pass@host:port`, only `socks5://` (local
   DNS through our guarded resolver, IP-literal CONNECT, TLS verified against the original host).

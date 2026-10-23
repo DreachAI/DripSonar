@@ -68,6 +68,7 @@ pub struct RouteConfig {
     hosts: Arc<[String]>,
     budget: Arc<Budget>,
     concurrency: usize,
+    slots: Arc<tokio::sync::Semaphore>,
     idle_timeout: Duration,
 }
 
@@ -84,6 +85,18 @@ impl fmt::Debug for RouteConfig {
 }
 
 impl RouteConfig {
+    pub fn has_proxy(&self) -> bool {
+        self.upstream.is_some()
+    }
+
+    /// An isolated route policy sharing the original guard and daily byte budget.
+    pub(crate) fn proxy_only(&self) -> Self {
+        Self {
+            hosts: vec!["*".to_owned()].into(),
+            ..self.clone()
+        }
+    }
+
     pub fn from_config(cfg: &Config) -> Result<Self, EgressError> {
         let upstream = cfg
             .proxy
@@ -144,6 +157,7 @@ impl RouteConfig {
             hosts: hosts.into(),
             budget,
             concurrency: cfg.forward_proxy_concurrency,
+            slots: Arc::new(tokio::sync::Semaphore::new(cfg.forward_proxy_concurrency)),
             idle_timeout: Duration::from_millis(cfg.forward_proxy_idle_timeout_ms),
         })
     }

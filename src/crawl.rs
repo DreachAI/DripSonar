@@ -358,6 +358,7 @@ pub async fn map(
     if !req.sitemap_only {
         let request = ScrapeRequest {
             url: seed.to_string(),
+            proxy: Default::default(),
             headers: Vec::new(),
             deadline,
             max_age: Duration::from_secs(86400),

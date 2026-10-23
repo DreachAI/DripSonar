@@ -115,6 +115,7 @@ async fn pages(
     writer: &mut impl Write,
 ) -> Result<u64, Box<dyn Error>> {
     let template = ScrapeTemplate {
+        proxy: Default::default(),
         headers: Vec::new(),
         timeout_ms: 30_000,
         max_age_ms: 0,

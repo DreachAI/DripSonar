@@ -1,4 +1,7 @@
-//! Bounded structured extraction through an operator-trusted OpenAI-compatible endpoint.
+//! Bounded structured extraction through an operator-trusted OpenAI-compatible endpoint, or
+//! deterministic CSS selectors (`css`) without one.
+
+pub mod css;
 
 use std::{fmt, time::Duration};
 
@@ -66,12 +69,17 @@ pub(crate) struct JsonOptions {
     pub schema: Option<Value>,
     pub prompt: Option<String>,
     pub system_prompt: Option<String>,
+    /// DripSonar extension: CSS extraction, which wins over the LLM when both are given.
+    pub selectors: Option<css::Schema>,
 }
 
 impl JsonOptions {
     pub fn validate(&self) -> Result<(), String> {
         if let Some(schema) = &self.schema {
             check_schema(schema, 0)?;
+        }
+        if let Some(selectors) = &self.selectors {
+            selectors.validate()?;
         }
         Ok(())
     }

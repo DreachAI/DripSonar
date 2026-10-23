@@ -17,6 +17,10 @@ const NON_MAIN: &str = "header, footer, nav, aside, .header, .top, .navbar, #hea
     .social-links, #social, .menu, .navigation, #nav, .breadcrumbs, #breadcrumbs, .share, #share, \
     .widget, #widget, .cookie, #cookie";
 
+/// An element holding any of these is kept even when it matches `NON_MAIN`: sites wrap their
+/// whole page in a `.top` or `.menu` class.
+const MAIN_MARKERS: &str = "#main, main, [role=main]";
+
 const CHALLENGE_STATUSES: [u16; 3] = [403, 429, 503];
 const CHALLENGE_TITLES: [&str; 6] = [
     "just a moment...",
@@ -187,7 +191,7 @@ fn remove_matches(doc: &Document, selector: &str, keep_main: bool) {
     }
     for n in doc.select(selector).nodes() {
         let sel = Selection::from(*n);
-        if keep_main && (sel.is("#main") || sel.select("#main").exists()) {
+        if keep_main && (sel.is(MAIN_MARKERS) || sel.select(MAIN_MARKERS).exists()) {
             continue;
         }
         n.remove_from_parent();
@@ -270,8 +274,9 @@ fn metadata(doc: &Document, base: &Url) -> PageMetadata {
         .select("link[rel][href]")
         .nodes()
         .iter()
-        .find(|n| n.attr_or("rel", "").to_ascii_lowercase().contains("icon"))
-        .and_then(|n| base.join(n.attr("href")?.trim()).ok())
+        .filter(|n| n.attr_or("rel", "").to_ascii_lowercase().contains("icon"))
+        .filter_map(|n| base.join(n.attr("href")?.trim()).ok())
+        .find(|u| matches!(u.scheme(), "http" | "https"))
         .map(|u| u.to_string());
 
     let mut named = BTreeMap::new();

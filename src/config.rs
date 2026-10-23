@@ -21,17 +21,17 @@ pub struct Config {
     /// Ports allowed besides 80 and 443.
     #[arg(long, env = "SONAR_EXTRA_PORTS", value_delimiter = ',')]
     pub extra_ports: Vec<u16>,
-    #[arg(long, default_value_t = 10_485_760, value_parser = at_least_one())]
+    #[arg(long, env = "SONAR_MAX_BODY_BYTES", default_value_t = 10_485_760, value_parser = at_least_one())]
     pub max_body_bytes: usize,
-    #[arg(long, default_value_t = 32, value_parser = at_least_one())]
+    #[arg(long, env = "SONAR_GLOBAL_CONCURRENCY", default_value_t = 256, value_parser = at_least_one())]
     pub global_concurrency: usize,
-    #[arg(long, default_value_t = 2, value_parser = at_least_one())]
+    #[arg(long, env = "SONAR_PER_HOST_CONCURRENCY", default_value_t = 2, value_parser = at_least_one())]
     pub per_host_concurrency: usize,
-    #[arg(long, default_value_t = 250)]
+    #[arg(long, env = "SONAR_PER_HOST_SPACING_MS", default_value_t = 250)]
     pub per_host_spacing_ms: u64,
-    #[arg(long, default_value_t = 120_000, value_parser = clap::value_parser!(u64).range(1000..))]
+    #[arg(long, env = "SONAR_MAX_TIMEOUT_MS", default_value_t = 120_000, value_parser = clap::value_parser!(u64).range(1000..))]
     pub max_timeout_ms: u64,
-    #[arg(long, default_value_t = 86_400_000)]
+    #[arg(long, env = "SONAR_DEFAULT_MAX_AGE_MS", default_value_t = 86_400_000)]
     pub default_max_age_ms: u64,
 }
 

@@ -1,6 +1,6 @@
-//! Search providers: SearXNG, then DuckDuckGo HTML.
+//! Search providers: SearXNG, then DuckDuckGo, Mojeek, and Brave HTML.
 
-use std::{collections::HashSet, future::Future};
+use std::{collections::HashSet, future::Future, sync::Arc, time::Duration};
 
 use crate::{
     config::Config,
@@ -9,6 +9,11 @@ use crate::{
 use dom_query::Document;
 use tokio::time::{Instant, timeout_at};
 use url::Url;
+
+/// Largest search response read, from any provider.
+const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
+/// Same-origin redirects followed for the operator's own SearXNG.
+const TRUSTED_MAX_REDIRECTS: usize = 3;
 
 #[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 pub struct Hit {
@@ -115,6 +120,63 @@ fn duckduckgo_page(html: &str) -> Result<Vec<Hit>, SearchError> {
     Ok(duckduckgo_hits(&document))
 }
 
+// Mojeek: markers are best-effort and checked against its markup of 2026-10.
+const MOJEEK_URL: &str = "https://www.mojeek.com/search";
+const MOJEEK_ITEM: &str = "ul.results-standard > li";
+const MOJEEK_LINK: &str = "a.title";
+const MOJEEK_TITLE: &str = "a.title";
+const MOJEEK_SNIPPET: &str = "p.s";
+const MOJEEK_EMPTY: &str = ".no-results, .noresults";
+
+// Brave: markers are best-effort and checked against its markup of 2026-10.
+const BRAVE_URL: &str = "https://search.brave.com/search";
+const BRAVE_ITEM: &str = "div.snippet[data-type='web']";
+const BRAVE_LINK: &str = "a[href^='http']";
+const BRAVE_TITLE: &str = ".search-snippet-title";
+const BRAVE_SNIPPET: &str = ".generic-snippet .content";
+const BRAVE_EMPTY: &str = ".no-results, #no-results";
+
+/// CSS markers of one HTML results page.
+struct Markers {
+    item: &'static str,
+    link: &'static str,
+    title: &'static str,
+    snippet: &'static str,
+    empty: &'static str,
+}
+
+const MOJEEK: Markers = Markers {
+    item: MOJEEK_ITEM,
+    link: MOJEEK_LINK,
+    title: MOJEEK_TITLE,
+    snippet: MOJEEK_SNIPPET,
+    empty: MOJEEK_EMPTY,
+};
+const BRAVE: Markers = Markers {
+    item: BRAVE_ITEM,
+    link: BRAVE_LINK,
+    title: BRAVE_TITLE,
+    snippet: BRAVE_SNIPPET,
+    empty: BRAVE_EMPTY,
+};
+
+/// Hits of a results page. A page with neither results nor the engine's no-results marker is a
+/// block, captcha, or layout change, and fails instead of reading as zero results.
+fn marked_page(html: &str, m: &Markers) -> Result<Vec<Hit>, SearchError> {
+    let document = Document::from(html);
+    if !document.select(m.item).exists() && !document.select(m.empty).exists() {
+        return Err(SearchError::AllProvidersFailed);
+    }
+    let hits = document.select(m.item).iter().filter_map(|item| {
+        Some(Hit {
+            url: item.select(m.link).first().attr("href")?.to_string(),
+            title: item.select(m.title).first().text().to_string(),
+            description: item.select(m.snippet).first().text().to_string(),
+        })
+    });
+    Ok(normalize(hits))
+}
+
 fn normalize(hits: impl IntoIterator<Item = Hit>) -> Vec<Hit> {
     let mut seen = HashSet::new();
     hits.into_iter()
@@ -151,15 +213,22 @@ fn clean_text(text: &str, cap: usize) -> String {
 #[derive(Clone)]
 pub struct Searcher {
     fetcher: Fetcher,
-    searxng: Option<Url>,
+    /// The operator's SearXNG and the unguarded client that reaches it.
+    searxng: Option<(Url, Arc<reqwest::Client>)>,
 }
 
 impl Searcher {
     pub fn new(fetcher: Fetcher, cfg: &Config) -> Self {
-        Self {
-            fetcher,
-            searxng: cfg.searxng_endpoint.clone(),
-        }
+        let searxng = cfg.searxng_endpoint.clone().and_then(|endpoint| {
+            match trusted_client(&endpoint, &cfg.user_agent) {
+                Ok(client) => Some((endpoint, Arc::new(client))),
+                Err(error) => {
+                    tracing::error!(%error, "searxng disabled: client not built");
+                    None
+                }
+            }
+        });
+        Self { fetcher, searxng }
     }
 
     pub async fn search(
@@ -169,15 +238,149 @@ impl Searcher {
         lang: &str,
         deadline: Instant,
     ) -> Result<Vec<Hit>, SearchError> {
+        let searxng = self.searxng.as_ref();
         run_chain(
-            self.searxng.as_ref(),
+            searxng.map(|(endpoint, _)| endpoint),
             query,
             limit,
             lang,
             deadline,
-            |target| async move { self.fetcher.fetch(&target).await },
+            |target| async move {
+                match searxng {
+                    Some((endpoint, client)) if target.url.origin() == endpoint.origin() => {
+                        fetch_trusted(client, &target).await
+                    }
+                    _ => self.fetcher.fetch(&target).await,
+                }
+            },
         )
         .await
+    }
+}
+
+/// A client for the operator-configured SearXNG origin only. SearXNG usually runs on a loopback
+/// or private address, which the guarded fetcher refuses. Redirects stay on that origin.
+fn trusted_client(endpoint: &Url, user_agent: &str) -> Result<reqwest::Client, reqwest::Error> {
+    let origin = endpoint.origin();
+    reqwest::Client::builder()
+        .user_agent(user_agent)
+        .no_proxy()
+        .redirect(reqwest::redirect::Policy::custom(move |attempt| {
+            if attempt.previous().len() <= TRUSTED_MAX_REDIRECTS && attempt.url().origin() == origin
+            {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
+        .build()
+}
+
+/// One exchange with the trusted client, bounded by the target's deadline and byte cap.
+async fn fetch_trusted(client: &reqwest::Client, target: &Target) -> Result<Fetched, FetchError> {
+    let remaining = target
+        .deadline
+        .saturating_duration_since(Instant::now())
+        .max(Duration::from_millis(1));
+    let exchange = async {
+        let mut response = client
+            .get(target.url.clone())
+            .timeout(remaining)
+            .send()
+            .await
+            .map_err(trusted_error)?;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(trusted_error)? {
+            if body.len() + chunk.len() > target.max_bytes {
+                return Err(FetchError::TooLarge);
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(Fetched {
+            requested_url: target.url.clone(),
+            final_url: response.url().clone(),
+            status: response.status().as_u16(),
+            headers: Vec::new(),
+            content_type: response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(str::to_owned),
+            body: body.into(),
+            fetched_at: time::OffsetDateTime::now_utc(),
+        })
+    };
+    timeout_at(target.deadline, exchange)
+        .await
+        .unwrap_or(Err(FetchError::Timeout))
+}
+
+fn trusted_error(error: reqwest::Error) -> FetchError {
+    if error.is_timeout() {
+        FetchError::Timeout
+    } else {
+        FetchError::Connect
+    }
+}
+
+#[derive(Clone, Copy)]
+enum Provider<'a> {
+    Searxng(&'a Url),
+    DuckDuckGo,
+    Mojeek,
+    Brave,
+}
+
+impl Provider<'_> {
+    /// Result pages requested: only SearXNG pages through its JSON.
+    fn pages(self) -> u32 {
+        if matches!(self, Self::Searxng(_)) {
+            5
+        } else {
+            1
+        }
+    }
+
+    fn url(self, query: &str, lang: &str, page: u32) -> Result<Url, SearchError> {
+        let mut url = match self {
+            Self::Searxng(endpoint) => {
+                let mut url = endpoint.clone();
+                url.set_query(None);
+                url.set_fragment(None);
+                url.set_path(&format!("{}/search", url.path().trim_end_matches('/')));
+                Ok(url)
+            }
+            Self::DuckDuckGo => Url::parse("https://html.duckduckgo.com/html/"),
+            Self::Mojeek => Url::parse(MOJEEK_URL),
+            Self::Brave => Url::parse(BRAVE_URL),
+        }
+        .map_err(|_| SearchError::AllProvidersFailed)?;
+        let mut params = url.query_pairs_mut();
+        params.append_pair("q", query);
+        match self {
+            Self::Searxng(_) => {
+                params
+                    .append_pair("format", "json")
+                    .append_pair("language", lang)
+                    .append_pair("pageno", &page.to_string());
+            }
+            Self::Brave => {
+                params.append_pair("source", "web");
+            }
+            Self::DuckDuckGo | Self::Mojeek => {}
+        }
+        drop(params);
+        Ok(url)
+    }
+
+    /// Parsed hits and whether the engine reported any results at all (SearXNG paging).
+    fn parse(self, fetched: &Fetched) -> Result<(Vec<Hit>, bool), SearchError> {
+        match self {
+            Self::Searxng(_) => searxng_page(&fetched.body),
+            Self::DuckDuckGo => duckduckgo_page(&fetched.text()).map(|hits| (hits, false)),
+            Self::Mojeek => marked_page(&fetched.text(), &MOJEEK).map(|hits| (hits, false)),
+            Self::Brave => marked_page(&fetched.text(), &BRAVE).map(|hits| (hits, false)),
+        }
     }
 }
 
@@ -199,39 +402,24 @@ where
     if limit == 0 {
         return Ok(Vec::new());
     }
-    for endpoint in searxng.into_iter().map(Some).chain(std::iter::once(None)) {
+    let providers = searxng.map(Provider::Searxng).into_iter().chain([
+        Provider::DuckDuckGo,
+        Provider::Mojeek,
+        Provider::Brave,
+    ]);
+    for provider in providers {
         let mut hits = Vec::new();
         let mut seen = HashSet::new();
-        let pages = if endpoint.is_some() { 5 } else { 1 };
+        let pages = provider.pages();
         for page in 1..=pages {
             if Instant::now() >= deadline {
                 return Err(SearchError::Timeout);
             }
-            let mut url = match endpoint {
-                Some(endpoint) => endpoint.clone(),
-                None => Url::parse("https://html.duckduckgo.com/html/")
-                    .map_err(|_| SearchError::AllProvidersFailed)?,
-            };
-            url.set_query(None);
-            url.set_fragment(None);
-            if endpoint.is_some() {
-                url.set_path(&format!("{}/search", url.path().trim_end_matches('/')));
-            }
-            {
-                let mut params = url.query_pairs_mut();
-                params.append_pair("q", query);
-                if endpoint.is_some() {
-                    params
-                        .append_pair("format", "json")
-                        .append_pair("language", lang)
-                        .append_pair("pageno", &page.to_string());
-                }
-            }
             let target = Target {
-                url,
+                url: provider.url(query, lang, page)?,
                 headers: Vec::new(),
                 deadline,
-                max_bytes: 2 * 1024 * 1024,
+                max_bytes: MAX_RESPONSE_BYTES,
             };
             let response = timeout_at(deadline, fetch(target)).await;
             if Instant::now() >= deadline || response.is_err() {
@@ -242,12 +430,7 @@ where
                 Ok(Err(FetchError::Timeout)) => return Err(SearchError::Timeout),
                 _ => break,
             };
-            let parsed = if endpoint.is_some() {
-                searxng_page(&fetched.body)
-            } else {
-                duckduckgo_page(&fetched.text()).map(|hits| (hits, false))
-            };
-            let Ok((page_hits, has_results)) = parsed else {
+            let Ok((page_hits, has_results)) = provider.parse(&fetched) else {
                 break;
             };
             hits.extend(
@@ -294,9 +477,9 @@ mod tests {
             (Some((200, "not JSON")), ddg, Some(2), 2),
             (Some((200, r#"{"results":[]}"#)), ddg, Some(0), 1),
             (None, "<div class='no-results'>No results</div>", Some(0), 2),
-            (None, "<div class='anomaly-modal'>captcha</div>", None, 2),
-            (None, "<form action='/anomaly.js?sv=html'></form>", None, 2),
-            (None, "not a search page", None, 2),
+            (None, "<div class='anomaly-modal'>captcha</div>", None, 4),
+            (None, "<form action='/anomaly.js?sv=html'></form>", None, 4),
+            (None, "not a search page", None, 4),
         ] {
             let mut calls = 0;
             let deadline = Instant::now() + Duration::from_secs(5);
@@ -309,7 +492,7 @@ mod tests {
                 |target| {
                     calls += 1;
                     assert_eq!(target.deadline, deadline);
-                    assert_eq!(target.max_bytes, 2 * 1024 * 1024);
+                    assert_eq!(target.max_bytes, MAX_RESPONSE_BYTES);
                     assert_eq!(
                         target
                             .url
@@ -330,7 +513,8 @@ mod tests {
                             Ok(response(target, status, body))
                         })
                     } else {
-                        assert_eq!(target.url.host_str(), Some("html.duckduckgo.com"));
+                        let hosts = ["html.duckduckgo.com", "www.mojeek.com", "search.brave.com"];
+                        assert_eq!(target.url.host_str(), Some(hosts[calls - 2]));
                         Ok(response(target, 200, second))
                     };
                     ready(result)

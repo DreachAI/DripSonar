@@ -44,6 +44,20 @@ pub struct Config {
     pub max_timeout_ms: u64,
     #[arg(long, env = "SONAR_DEFAULT_MAX_AGE_MS", default_value_t = 86_400_000)]
     pub default_max_age_ms: u64,
+    #[arg(long, env = "SONAR_JOB_WORKERS", default_value_t = 192, value_parser = at_least_one())]
+    pub job_workers: usize,
+    #[arg(long, env = "SONAR_MAX_ACTIVE_JOBS", default_value_t = 100, value_parser = at_least_one())]
+    pub max_active_jobs: usize,
+    #[arg(long, env = "SONAR_MAX_CRAWL_LIMIT", default_value_t = 100_000, value_parser = clap::value_parser!(u32).range(1..))]
+    pub max_crawl_limit: u32,
+    #[arg(long, env = "SONAR_JOB_RETENTION_HOURS", default_value_t = 24, value_parser = clap::value_parser!(u64).range(1..=87600))]
+    pub job_retention_hours: u64,
+    #[arg(long, env = "SONAR_MAP_TIMEOUT_MS", default_value_t = 60_000, value_parser = clap::value_parser!(u64).range(1000..=600_000))]
+    pub map_timeout_ms: u64,
+    #[arg(long, env = "SONAR_PUBLIC_URL")]
+    pub public_url: Option<url::Url>,
+    #[arg(long, env = "SONAR_MIN_FREE_DISK_MB", default_value_t = 2048)]
+    pub min_free_disk_mb: u64,
 }
 
 fn at_least_one() -> clap::builder::RangedU64ValueParser<usize> {
@@ -73,6 +87,16 @@ impl fmt::Debug for Config {
             .field("per_host_spacing_ms", &self.per_host_spacing_ms)
             .field("max_timeout_ms", &self.max_timeout_ms)
             .field("default_max_age_ms", &self.default_max_age_ms)
+            .field("job_workers", &self.job_workers)
+            .field("max_active_jobs", &self.max_active_jobs)
+            .field("max_crawl_limit", &self.max_crawl_limit)
+            .field("job_retention_hours", &self.job_retention_hours)
+            .field("map_timeout_ms", &self.map_timeout_ms)
+            .field(
+                "public_url",
+                &self.public_url.as_ref().map(|_| "<configured>"),
+            )
+            .field("min_free_disk_mb", &self.min_free_disk_mb)
             .finish()
     }
 }

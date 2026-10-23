@@ -2,6 +2,8 @@
 //!
 //! `/v1/scrape` and `/v1/search` speak Firecrawl v1; `/v1/web/*` speak context.dev.
 
+mod jobs;
+
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use axum::{
@@ -37,6 +39,10 @@ const SEARCH_SCRAPE_CONCURRENCY: usize = 4;
 
 #[derive(Clone)]
 pub struct AppState {
+    jobs: Option<crate::jobs::Jobs>,
+    store: Store,
+    fetcher: Fetcher,
+    job_config: Arc<Config>,
     scraper: Scraper,
     searcher: Searcher,
     api_key: Option<Arc<str>>,
@@ -48,12 +54,36 @@ impl AppState {
     pub fn new(cfg: &Config, fetcher: Fetcher) -> Result<Self, StoreError> {
         let store = Store::open(&cfg.data_dir)?;
         Ok(Self {
+            jobs: None,
+            store: store.clone(),
+            fetcher: fetcher.clone(),
+            job_config: Arc::new(cfg.clone()),
             scraper: Scraper::new(fetcher.clone(), store, cfg),
             searcher: Searcher::new(fetcher, cfg),
             api_key: cfg.api_key.as_deref().map(Arc::from),
             max_timeout_ms: cfg.max_timeout_ms,
             default_max_age_ms: cfg.default_max_age_ms,
         })
+    }
+
+    pub async fn start_jobs(
+        &mut self,
+    ) -> Result<tokio::task::JoinHandle<()>, crate::jobs::JobError> {
+        let (jobs, dispatcher) = crate::jobs::Jobs::start(
+            self.store.clone(),
+            self.scraper.clone(),
+            self.fetcher.clone(),
+            &self.job_config,
+        )
+        .await?;
+        self.jobs = Some(jobs);
+        Ok(dispatcher)
+    }
+
+    pub fn stop_jobs(&self) {
+        if let Some(jobs) = &self.jobs {
+            jobs.stop();
+        }
     }
 
     /// The requested timeout (at least one second), clamped to the server maximum.
@@ -106,6 +136,7 @@ pub fn router(state: AppState) -> Router {
         .route("/v1/search", post(search))
         .route("/v1/web/scrape", post(web_scrape))
         .route("/v1/web/search", post(web_search))
+        .merge(jobs::routes())
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
         .route("/health", get(|| async { "ok" }))
@@ -115,9 +146,9 @@ pub fn router(state: AppState) -> Router {
         .with_state(state)
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
-enum Format {
+pub(crate) enum Format {
     Markdown,
     Html,
     RawHtml,
@@ -424,7 +455,11 @@ async fn web_search(
 }
 
 /// Firecrawl `data` for one document: requested formats plus metadata.
-fn document_json(doc: &Document, formats: &[Format], source_url: &str) -> Map<String, Value> {
+pub(crate) fn document_json(
+    doc: &Document,
+    formats: &[Format],
+    source_url: &str,
+) -> Map<String, Value> {
     let rendered = &doc.rendered;
     let mut data = Map::new();
     for format in formats {
@@ -443,7 +478,7 @@ fn document_json(doc: &Document, formats: &[Format], source_url: &str) -> Map<St
     data
 }
 
-fn metadata_json(doc: &Document, source_url: &str) -> Value {
+pub(crate) fn metadata_json(doc: &Document, source_url: &str) -> Value {
     let mut meta = match serde_json::to_value(&doc.rendered.metadata) {
         Ok(Value::Object(meta)) => meta,
         _ => Map::new(),
@@ -488,33 +523,21 @@ fn has_content(doc: &Map<String, Value>) -> bool {
 }
 
 /// The Firecrawl error table in docs/ARCHITECTURE.md.
-fn scrape_failure(error: &ScrapeError) -> (StatusCode, &'static str) {
+pub(crate) fn scrape_failure(error: &ScrapeError) -> (StatusCode, &'static str) {
     const FAILED: StatusCode = StatusCode::INTERNAL_SERVER_ERROR;
-    match error {
-        ScrapeError::Invalid(_) => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
-        ScrapeError::Blocked => (FAILED, "SCRAPE_ALL_ENGINES_FAILED"),
-        ScrapeError::Unsupported(_) => (FAILED, "SCRAPE_UNSUPPORTED_FILE_ERROR"),
-        ScrapeError::Pdf(error) => match error {
-            crate::document::DocumentError::Timeout => {
-                (StatusCode::REQUEST_TIMEOUT, "SCRAPE_TIMEOUT")
-            }
-            crate::document::DocumentError::NoTextLayer => (FAILED, "SCRAPE_PDF_OCR_REQUIRED"),
-            crate::document::DocumentError::Encrypted | crate::document::DocumentError::Failed => {
-                (FAILED, "SCRAPE_UNSUPPORTED_FILE_ERROR")
-            }
-        },
+    let status = match error {
+        ScrapeError::Invalid(_) => StatusCode::BAD_REQUEST,
+        ScrapeError::Blocked | ScrapeError::Unsupported(_) => FAILED,
+        ScrapeError::Pdf(crate::document::DocumentError::Timeout) => StatusCode::REQUEST_TIMEOUT,
+        ScrapeError::Pdf(_) => FAILED,
         ScrapeError::Fetch(error) => match error {
-            FetchError::Refused(_) => (StatusCode::FORBIDDEN, "SCRAPE_SITE_ERROR"),
-            FetchError::Dns => (StatusCode::OK, "SCRAPE_DNS_RESOLUTION_ERROR"),
-            FetchError::Timeout => (StatusCode::REQUEST_TIMEOUT, "SCRAPE_TIMEOUT"),
-            FetchError::Tls => (FAILED, "SCRAPE_SSL_ERROR"),
-            FetchError::Overloaded => (StatusCode::REQUEST_TIMEOUT, "CONCURRENCY_QUEUE_TIMEOUT"),
-            FetchError::Connect
-            | FetchError::TooManyRedirects
-            | FetchError::TooLarge
-            | FetchError::Protocol => (FAILED, "SCRAPE_SITE_ERROR"),
+            FetchError::Refused(_) => StatusCode::FORBIDDEN,
+            FetchError::Dns => StatusCode::OK,
+            FetchError::Timeout | FetchError::Overloaded => StatusCode::REQUEST_TIMEOUT,
+            _ => FAILED,
         },
-    }
+    };
+    (status, error.code())
 }
 
 /// Strict JSON: unknown fields and unknown formats are a 400 that names them.

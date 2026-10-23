@@ -2,14 +2,20 @@
 
 use std::collections::HashSet;
 
-use dom_query::{Document, Matcher, NodeRef, Selection};
+use dom_query::{Document, Matcher, NodeRef};
 use serde_json::{Map, Value};
+
+use crate::page;
 
 const MAX_ITEMS: usize = 1000;
 const MAX_FIELDS: usize = 100;
 const MAX_DEPTH: usize = 4;
 /// Nodes visited across all selections and values; a careless schema cannot pin a render slot.
 const MAX_VISITS: usize = 2_000_000;
+/// Output bytes across all keys and values of one extraction.
+const MAX_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+/// Quotes, colon, comma, and a `null` beside each key name.
+const KEY_OVERHEAD_BYTES: usize = 8;
 
 #[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
@@ -96,36 +102,69 @@ fn check_fields(fields: &[Field], depth: usize, count: &mut usize) -> Result<(),
 }
 
 /// An array of objects, one per `baseSelector` match, or one object for the whole page.
-/// `Null` when the work limit is reached, so a partial result never passes as complete.
+/// `Null` when the DOM exceeds the page limits or the work or output budget runs out, so a
+/// partial result never passes as complete.
 pub fn extract(doc: &Document, schema: &Schema) -> Value {
-    let mut budget = MAX_VISITS;
-    let root = Selection::from(doc.root());
-    let value = match &schema.base_selector {
-        Some(base) => all(&root, base, &mut budget)
-            .into_iter()
-            .map(|item| object(&item, &schema.fields, &mut budget))
-            .collect(),
-        None => object(&root, &schema.fields, &mut budget),
+    let root = doc.root();
+    if !page::dom_within_limits(root) {
+        return Value::Null;
+    }
+    let mut budget = Budget {
+        visits: MAX_VISITS,
+        bytes: MAX_OUTPUT_BYTES,
+        exhausted: false,
     };
-    if budget == 0 { Value::Null } else { value }
+    let value = match &schema.base_selector {
+        Some(base) => matches(root, base, MAX_ITEMS, &mut budget)
+            .into_iter()
+            .map(|item| object(item, &schema.fields, &mut budget))
+            .collect(),
+        None => object(root, &schema.fields, &mut budget),
+    };
+    if budget.exhausted { Value::Null } else { value }
 }
 
-fn object(scope: &Selection, fields: &[Field], budget: &mut usize) -> Value {
+/// Work and output allowance shared by one extraction; once exhausted, every charge fails.
+struct Budget {
+    visits: usize,
+    bytes: usize,
+    exhausted: bool,
+}
+
+impl Budget {
+    fn visit(&mut self) -> bool {
+        self.exhausted |= self.visits == 0;
+        self.visits = self.visits.saturating_sub(1);
+        !self.exhausted
+    }
+
+    /// Charged before output is copied, so the budget bounds memory, not just the result.
+    fn spend(&mut self, bytes: usize) -> bool {
+        self.exhausted |= bytes > self.bytes;
+        self.bytes = self.bytes.saturating_sub(bytes);
+        !self.exhausted
+    }
+}
+
+fn object(scope: NodeRef, fields: &[Field], budget: &mut Budget) -> Value {
     let mut out = Map::new();
     for field in fields {
+        if !budget.spend(field.name.len() + KEY_OVERHEAD_BYTES) {
+            return Value::Null;
+        }
         out.insert(field.name.clone(), value(scope, field, budget));
     }
     Value::Object(out)
 }
 
-fn value(scope: &Selection, field: &Field, budget: &mut usize) -> Value {
+fn value(scope: NodeRef, field: &Field, budget: &mut Budget) -> Value {
     if let Kind::List = field.kind {
         let items = match &field.selector {
-            Some(selector) => all(scope, selector, budget),
-            None => scope.nodes().iter().map(|n| Selection::from(*n)).collect(),
+            Some(selector) => matches(scope, selector, MAX_ITEMS, budget),
+            None => vec![scope],
         };
         return items
-            .iter()
+            .into_iter()
             .map(|item| match field.fields.as_slice() {
                 [] => text(item, budget),
                 fields => object(item, fields, budget),
@@ -133,62 +172,90 @@ fn value(scope: &Selection, field: &Field, budget: &mut usize) -> Value {
             .collect();
     }
     let target = match &field.selector {
-        Some(selector) => first(scope, selector, budget),
-        None => scope.nodes().first().copied(),
+        Some(selector) => matches(scope, selector, 1, budget).pop(),
+        None => Some(scope),
     };
     let Some(node) = target else {
         return Value::Null;
     };
-    let element = Selection::from(node);
     match field.kind {
         Kind::Attribute => field
             .attribute
             .as_deref()
-            .and_then(|name| element.attr(name))
+            .and_then(|name| node.attr(name))
+            .filter(|v| budget.spend(v.len()))
             .map_or(Value::Null, |v| v.trim().into()),
-        Kind::Html if charge(&node, budget) => element.html().to_string().into(),
-        Kind::Html => Value::Null,
-        Kind::Nested => object(&element, &field.fields, budget),
-        Kind::Text | Kind::List => text(&element, budget),
+        Kind::Html => html(node, budget),
+        Kind::Nested => object(node, &field.fields, budget),
+        Kind::Text | Kind::List => text(node, budget),
     }
 }
 
-/// Every match under the scope, capped at `MAX_ITEMS`.
-fn all<'a>(scope: &Selection<'a>, selector: &str, budget: &mut usize) -> Vec<Selection<'a>> {
+/// Up to `limit` matches under the scope in document order, spending one visit per node walked.
+fn matches<'a>(
+    scope: NodeRef<'a>,
+    selector: &str,
+    limit: usize,
+    budget: &mut Budget,
+) -> Vec<NodeRef<'a>> {
     let Ok(matcher) = Matcher::new(selector) else {
         return Vec::new();
     };
-    if !scope.nodes().iter().all(|n| charge(n, budget)) {
-        return Vec::new();
+    let mut found = Vec::new();
+    for node in scope.descendants_it() {
+        if found.len() == limit || !budget.visit() {
+            break;
+        }
+        if node.is_match(&matcher) {
+            found.push(node);
+        }
     }
-    let matches = scope.select_matcher(&matcher);
-    let nodes = matches.nodes().iter().take(MAX_ITEMS);
-    nodes.map(|n| Selection::from(*n)).collect()
+    found
 }
 
-fn first<'a>(scope: &Selection<'a>, selector: &str, budget: &mut usize) -> Option<NodeRef<'a>> {
-    let matcher = Matcher::new(selector).ok()?;
-    if !scope.nodes().iter().all(|n| charge(n, budget)) {
-        return None;
+fn text(node: NodeRef, budget: &mut Budget) -> Value {
+    // Raw text bytes bound the whitespace-collapsed copy.
+    match size(node, false, budget) {
+        Some(bytes) if budget.spend(bytes) => {
+            let text = node.text();
+            text.split_whitespace().collect::<Vec<_>>().join(" ").into()
+        }
+        _ => Value::Null,
     }
-    scope
-        .select_single_matcher(&matcher)
-        .nodes()
-        .first()
-        .copied()
 }
 
-fn text(element: &Selection, budget: &mut usize) -> Value {
-    if !element.nodes().iter().all(|n| charge(n, budget)) {
+fn html(node: NodeRef, budget: &mut Budget) -> Value {
+    let Some(estimate) = size(node, true, budget).filter(|&bytes| budget.spend(bytes)) else {
         return Value::Null;
+    };
+    let html = node.html();
+    // Escaping can outgrow the estimate; charge the rest so the total stays exact.
+    if budget.spend(html.len().saturating_sub(estimate)) {
+        html.to_string().into()
+    } else {
+        Value::Null
     }
-    let text = element.text();
-    text.split_whitespace().collect::<Vec<_>>().join(" ").into()
 }
 
-/// Spends the node's subtree size; counting stops at the remaining budget, so it is bounded too.
-fn charge(node: &NodeRef, budget: &mut usize) -> bool {
-    let size = 1 + node.descendants_it().take(*budget).count();
-    *budget = budget.saturating_sub(size);
-    *budget > 0
+/// The subtree's text bytes, or with `markup` its unescaped serialized size, spending one visit
+/// per node; `None` when the visits run out.
+fn size(node: NodeRef, markup: bool, budget: &mut Budget) -> Option<usize> {
+    let mut bytes = 0;
+    for n in std::iter::once(node).chain(node.descendants_it()) {
+        if !budget.visit() {
+            return None;
+        }
+        if n.is_text() {
+            bytes += n.text().len();
+        } else if markup && n.is_element() {
+            let name = n.node_name().map_or(0, |name| name.len());
+            let attrs: usize = n
+                .attrs()
+                .iter()
+                .map(|a| a.name.local.len() + a.value.len() + 4)
+                .sum();
+            bytes += 2 * name + 5 + attrs;
+        }
+    }
+    Some(bytes)
 }

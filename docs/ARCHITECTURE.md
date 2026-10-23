@@ -362,18 +362,23 @@ minutes (never below configured spacing); successful 2xx responses halve it towa
 
 - As built: DripSonar extension format `fitMarkdown` (v1 string, v2 `{type:"fitMarkdown"}`),
   returned as `data.fitMarkdown`; jobs accept it. Runs in the bounded blocking render path.
-- `dom_smoothie` 0.18 readability runs on the cleaned body (after include/exclude tags, before
-  main-content selectors); under 200 visible characters, the cleaned body stands in. Pruning then
-  drops boilerplate tags and comments, removes any element whose class or id contains `nav`,
-  `footer`, `header`, `sidebar`, `ads`, `comment`, `promo`, `advert`, `social`, or `share`, and
-  walks top-down removing subtrees scoring under 0.48 on 0.4·text density + 0.2·(1 − direct-link
-  text share) + 0.2·tag weight + 0.1·ln(text length + 1) (Crawl4AI's pruning filter,
-  reimplemented). Images and other void elements are not scored; they go with their container.
+- `dom_smoothie` 0.18 readability (capped at 100k elements) runs on the cleaned body (after
+  include/exclude tags, before main-content selectors) when the page DOM is within 200k elements
+  and 256 levels; past that, or under 200 visible characters, the cleaned body stands in. Pruning
+  then drops boilerplate tags and comments, removes any element whose class or id has a whole
+  token (split on non-alphanumerics) `nav`, `footer`, `header`, `sidebar`, `ads`, `ad`, `comment`,
+  `comments`, `promo`, `advert`, `social`, `share`, or `sharing`, except `main`, `article`,
+  `[role=main]` and their ancestors, and walks top-down removing subtrees scoring under 0.48 on
+  0.4·text density + 0.2·(1 − direct-link text share) + 0.2·tag weight + 0.1·ln(text length + 1)
+  (Crawl4AI's pruning filter, reimplemented; lengths in characters, markup counted escaped).
+  Images and other void elements are not scored; they go with their container, and textless
+  elements holding a linked image are never pruned for their score. When pruning keeps under a
+  fifth of the visible text, the unpruned article (or body) is rendered instead.
 - Links become `text⟨N⟩` and images `![alt⟨N⟩]`, numbering unique http(s) URLs in first-seen
-  order, followed by `## References` lines `⟨N⟩ url: title` (title attribute, else link text).
-- When `onlyMainContent` selectors leave under 200 visible characters, the readability article
-  also feeds `markdown`; Firecrawl's selector path stays primary. Plain text and PDFs return
-  their markdown unchanged as `fitMarkdown`.
+  order, followed by `## References` lines `⟨N⟩ url: title` (title attribute, else link text),
+  whitespace-collapsed with `` \ [ ] * _ ` < > ⟨ ⟩ `` backslash-escaped.
+- Readability feeds only `fitMarkdown`; `markdown` keeps the main-content selector path. Plain
+  text and PDFs return their markdown unchanged as `fitMarkdown`.
 
 ### CSS extraction (`extract::css`)
 
@@ -383,10 +388,11 @@ minutes (never below configured spacing); successful 2xx responses halve it towa
   `selector` reads the element in scope. `data.json` is an array (one object per `baseSelector`
   match) or one object for the page. Text is whitespace-collapsed; missing matches are `null`.
 - Validated before collection (valid selectors, unique names, at most 100 fields, nesting depth
-  4); runs on the original DOM in the render path, capped at 1000 matches per selection and a
-  2M-node work budget, past which `json` is `null` with a warning. Selectors win over an LLM
-  schema in the same request, so no LLM call is made, and work without `SONAR_LLM_URL`. Jobs
-  still reject the json format.
+  4); runs on the original DOM in the render path. A DOM over 200k elements or 256 levels, a
+  2M-node work budget (one per node walked), or an 8 MiB output budget (keys and values, charged
+  before copying) makes `json` `null` with a warning; selections stop at 1000 matches. Selectors
+  win over an LLM schema in the same request, so no LLM call is made, and work without
+  `SONAR_LLM_URL`. Jobs still reject the json format.
 
 
 ### Change tracking

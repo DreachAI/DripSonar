@@ -29,9 +29,11 @@ struct HostSlot {
     next_start: Mutex<Instant>,
 }
 
-/// Held while one request and its body are in flight.
+/// Held while one request and its body are in flight. Holding the slot keeps it tracked, so
+/// eviction never splits a busy host into two slots with separate limits and spacing.
 pub(super) struct Pass {
     _host: OwnedSemaphorePermit,
+    _slot: Arc<HostSlot>,
     _global: OwnedSemaphorePermit,
 }
 
@@ -71,6 +73,7 @@ impl Gate {
         sleep_until(start).await;
         Ok(Pass {
             _host: host_permit,
+            _slot: slot,
             _global: global,
         })
     }

@@ -41,6 +41,9 @@ pub struct RenderOptions {
     pub markdown: bool,
     pub html: bool,
     pub links: bool,
+    /// Firecrawl's `parsePDF: false`: a PDF yields no text. Absent in stored job templates.
+    #[serde(default)]
+    pub skip_pdf_parsing: bool,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -58,13 +61,15 @@ pub struct PageMetadata {
     pub og_image: Option<String>,
     pub og_site_name: Option<String>,
     pub og_locale: Option<String>,
+    pub og_locale_alternate: Option<Vec<String>>,
     pub published_time: Option<String>,
     pub modified_time: Option<String>,
     pub dc_date: Option<String>,
     pub dc_date_created: Option<String>,
     pub dc_terms_created: Option<String>,
+    /// Other meta tags by lowercased key: one value as a string, repeated values as an array.
     #[serde(flatten)]
-    pub extra: BTreeMap<String, String>,
+    pub extra: BTreeMap<String, serde_json::Value>,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -87,16 +92,17 @@ pub fn render(html: &str, base_url: &Url, opts: &RenderOptions) -> Rendered {
     let links = opts.links.then(|| links(&doc, &base));
 
     doc.select(STRIP_TAGS).remove();
-    let body = match doc.try_select("body").map(|b| b.inner_html()) {
-        Some(inner) if !opts.include_tags.is_empty() => included(&inner, &opts.include_tags),
-        Some(inner) => Document::from(format!("<body>{inner}</body>")),
-        None => Document::from("<body></body>"),
-    };
-    for sel in &opts.exclude_tags {
-        remove_matches(&body, sel, false);
-    }
-    if opts.only_main_content {
-        remove_matches(&body, NON_MAIN, true);
+    let inner = doc
+        .try_select("body")
+        .map(|b| b.inner_html().to_string())
+        .unwrap_or_default();
+    let mut body = selected(&inner, opts, opts.only_main_content);
+    // Some sites wrap all their text in a non-main class; an empty page helps nobody.
+    if opts.only_main_content && !has_text(&body) {
+        let full = selected(&inner, opts, false);
+        if has_text(&full) {
+            body = full;
+        }
     }
     fix_images(&body, opts.remove_base64_images);
     absolutize(&body, &base);
@@ -104,7 +110,7 @@ pub fn render(html: &str, base_url: &Url, opts: &RenderOptions) -> Rendered {
     let cleaned = body.select("body").inner_html().to_string();
     let markdown = opts
         .markdown
-        .then(|| collapse_blank_lines(&htmd::convert(&cleaned).unwrap_or_default()));
+        .then(|| cap_blank_runs(&htmd::convert(&cleaned).unwrap_or_default()));
     Rendered {
         markdown,
         html: opts.html.then_some(cleaned),
@@ -154,6 +160,26 @@ fn truncate(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// The body after `includeTags`, `excludeTags`, and, when `main_only`, the non-main filter.
+fn selected(inner: &str, opts: &RenderOptions, main_only: bool) -> Document {
+    let body = if opts.include_tags.is_empty() {
+        Document::from(format!("<body>{inner}</body>"))
+    } else {
+        included(inner, &opts.include_tags)
+    };
+    for sel in &opts.exclude_tags {
+        remove_matches(&body, sel, false);
+    }
+    if main_only {
+        remove_matches(&body, NON_MAIN, true);
+    }
+    body
+}
+
+fn has_text(body: &Document) -> bool {
+    !body.select("body").text().trim().is_empty()
 }
 
 /// Keeps only the outermost elements matching any include selector, in document order.
@@ -279,22 +305,27 @@ fn metadata(doc: &Document, base: &Url) -> PageMetadata {
         .find(|u| matches!(u.scheme(), "http" | "https"))
         .map(|u| u.to_string());
 
-    let mut named = BTreeMap::new();
+    let mut named: BTreeMap<String, Vec<String>> = BTreeMap::new();
     for n in doc.select("meta[content]").nodes() {
         let Some(content) = text(n.attr_or("content", "").to_string()) else {
             continue;
         };
-        for attr in ["name", "property", "itemprop"] {
-            if let Some(key) = n
-                .attr(attr)
-                .map(|k| k.trim().to_ascii_lowercase())
-                .filter(|k| !k.is_empty())
-            {
-                named.entry(key).or_insert_with(|| content.clone());
-            }
+        let mut keys: Vec<String> = ["name", "property", "itemprop"]
+            .iter()
+            .filter_map(|attr| n.attr(attr).map(|k| k.trim().to_ascii_lowercase()))
+            .filter(|k| !k.is_empty())
+            .collect();
+        keys.sort();
+        keys.dedup();
+        for key in keys {
+            named.entry(key).or_default().push(content.clone());
         }
     }
-    let mut take = |key: &str| named.remove(key);
+    let mut take = |key: &str| {
+        named
+            .remove(key)
+            .and_then(|values| values.into_iter().next())
+    };
     m.description = take("description");
     m.keywords = take("keywords");
     m.robots = take("robots");
@@ -309,29 +340,53 @@ fn metadata(doc: &Document, base: &Url) -> PageMetadata {
     m.dc_date = take("dc.date");
     m.dc_date_created = take("dc.date.created");
     m.dc_terms_created = take("dcterms.created");
+    m.og_locale_alternate = named.remove("og:locale:alternate");
+    m.title = m
+        .title
+        .or_else(|| m.og_title.clone())
+        .or_else(|| named.get("twitter:title").and_then(|v| v.first().cloned()));
+    let clip =
+        |v: &String| serde_json::Value::from(v.chars().take(MAX_EXTRA_CHARS).collect::<String>());
     m.extra = named
         .into_iter()
         .take(MAX_EXTRA_ENTRIES)
-        .map(|(k, v)| (k, v.chars().take(MAX_EXTRA_CHARS).collect()))
+        .map(|(k, values)| match values.as_slice() {
+            [one] => (k, clip(one)),
+            many => (k, many.iter().take(MAX_EXTRA_ENTRIES).map(clip).collect()),
+        })
         .collect();
     m
 }
 
-/// Keeps at most one empty line in a row and trims the ends.
-fn collapse_blank_lines(md: &str) -> String {
+/// Caps runs of blank lines at two outside fenced code. Everything else stays as converted:
+/// trailing spaces are hard breaks, and code keeps its blank lines.
+fn cap_blank_runs(md: &str) -> String {
     let mut out = String::with_capacity(md.len());
-    let mut blank = false;
-    for line in md.lines().map(str::trim_end) {
-        if line.is_empty() {
-            blank = true;
-            continue;
+    let (mut fence, mut blanks) = (None, 0);
+    for line in md.split('\n') {
+        if fence.is_none() && line.trim().is_empty() {
+            blanks += 1;
+            if blanks > 2 {
+                continue;
+            }
+        } else {
+            blanks = 0;
         }
-        if blank && !out.is_empty() {
-            out.push('\n');
-        }
-        blank = false;
+        fence = match (fence, fence_marker(line)) {
+            (None, Some((marker, _))) => Some(marker),
+            (Some((c, n)), Some(((m, len), closes))) if closes && c == m && len >= n => None,
+            (open, _) => open,
+        };
         out.push_str(line);
         out.push('\n');
     }
-    out.trim_end().to_string()
+    out.trim_matches('\n').to_owned()
+}
+
+/// A fence line's character and length, and whether it could close a fence (no info string).
+fn fence_marker(line: &str) -> Option<((char, usize), bool)> {
+    let line = line.trim_start();
+    let c = line.chars().next().filter(|c| matches!(c, '`' | '~'))?;
+    let len = line.chars().take_while(|&x| x == c).count();
+    (len >= 3).then(|| ((c, len), line[len..].trim().is_empty()))
 }

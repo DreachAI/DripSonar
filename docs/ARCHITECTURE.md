@@ -108,6 +108,7 @@ Error mapping (Firecrawl v1 body `{success:false, code, error}`):
 | Connect, reset, too many redirects, oversized body | `SCRAPE_SITE_ERROR` | 500 |
 | Challenge or block page | `SCRAPE_ALL_ENGINES_FAILED` | 500 |
 | Unsupported content type | `SCRAPE_UNSUPPORTED_FILE_ERROR` | 500 |
+| Capture could not be stored | `SCRAPE_STORAGE_ERROR` | 500 |
 | Server overloaded past the queue deadline | `CONCURRENCY_QUEUE_TIMEOUT` | 408 |
 
 The context.dev shape reports the same outcome inside `markdown`: success sets `data`,

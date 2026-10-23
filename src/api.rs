@@ -143,6 +143,7 @@ impl AppState {
                 markdown: formats.contains(&Format::Markdown),
                 html: formats.contains(&Format::Html),
                 links: formats.contains(&Format::Links),
+                skip_pdf_parsing: !opts.parse_pdf.unwrap_or(true),
             },
             raw_html: formats.contains(&Format::RawHtml),
         };
@@ -232,6 +233,8 @@ struct ScrapeOptions {
     actions: Vec<Action>,
     remove_base64_images: Option<bool>,
     max_age: Option<u64>,
+    #[serde(rename = "parsePDF")]
+    parse_pdf: Option<bool>,
     // Accepted no-ops: a fixed desktop viewport, no ad blocker or proxy choice; captures are
     // always stored.
     #[serde(rename = "mobile")]
@@ -547,6 +550,9 @@ pub(crate) fn document_json(
     if let Some(actions) = &doc.browser.actions {
         data.insert("actions".into(), json!(actions));
     }
+    if let Some(warning) = &doc.warning {
+        data.insert("warning".into(), json!(warning));
+    }
     data.insert("metadata".into(), metadata_json(doc, source_url));
     data
 }
@@ -600,7 +606,7 @@ pub(crate) fn scrape_failure(error: &ScrapeError) -> (StatusCode, &'static str) 
     const FAILED: StatusCode = StatusCode::INTERNAL_SERVER_ERROR;
     let status = match error {
         ScrapeError::Invalid(_) => StatusCode::BAD_REQUEST,
-        ScrapeError::Blocked | ScrapeError::Unsupported(_) => FAILED,
+        ScrapeError::Blocked | ScrapeError::Unsupported(_) | ScrapeError::Storage => FAILED,
         ScrapeError::Pdf(crate::document::DocumentError::Timeout) => StatusCode::REQUEST_TIMEOUT,
         ScrapeError::Pdf(_) => FAILED,
         ScrapeError::Fetch(error) | ScrapeError::Browser(BrowserError::Fetch(error)) => match error

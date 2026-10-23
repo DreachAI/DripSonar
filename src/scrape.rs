@@ -52,6 +52,8 @@ pub struct Document {
     pub cached_at: Option<OffsetDateTime>,
     pub rendered: Rendered,
     pub raw_html: Option<String>,
+    /// Firecrawl's `warning`: why a successful document carries less than requested.
+    pub warning: Option<String>,
     /// Screenshot URL and action results from an explicit browser visit; never persisted,
     /// since jobs do not run browser plans.
     #[serde(skip)]
@@ -128,6 +130,8 @@ pub enum ScrapeError {
     Pdf(#[from] DocumentError),
     #[error(transparent)]
     Browser(#[from] BrowserError),
+    #[error("capture could not be stored")]
+    Storage,
 }
 
 impl ScrapeError {
@@ -137,6 +141,7 @@ impl ScrapeError {
             Self::Invalid(_) => "BAD_REQUEST",
             Self::Blocked => "SCRAPE_ALL_ENGINES_FAILED",
             Self::Unsupported(_) => "SCRAPE_UNSUPPORTED_FILE_ERROR",
+            Self::Storage => "SCRAPE_STORAGE_ERROR",
             Self::Pdf(DocumentError::Timeout) => "SCRAPE_TIMEOUT",
             Self::Pdf(DocumentError::NoTextLayer) => "SCRAPE_PDF_OCR_REQUIRED",
             Self::Pdf(DocumentError::Encrypted | DocumentError::Failed) => {
@@ -159,17 +164,47 @@ impl ScrapeError {
     }
 }
 
-type SharedFetch = Shared<BoxFuture<'static, Result<(Fetched, i64), FetchError>>>;
-type SharedRender = Shared<BoxFuture<'static, Result<(Fetched, i64), BrowserError>>>;
+/// What a shared fetch or render hands every waiter; `ScrapeError` itself is not `Clone`.
+#[derive(Clone, Debug)]
+enum FlightError {
+    Fetch(FetchError),
+    Browser(BrowserError),
+    Storage,
+}
+
+impl From<FlightError> for ScrapeError {
+    fn from(error: FlightError) -> Self {
+        match error {
+            FlightError::Fetch(error) => Self::Fetch(error),
+            FlightError::Browser(error) => Self::Browser(error),
+            FlightError::Storage => Self::Storage,
+        }
+    }
+}
+
+type Flight = Shared<BoxFuture<'static, Result<(Fetched, i64), FlightError>>>;
+type Flights = Arc<Mutex<HashMap<String, Flight>>>;
+
+/// Request validators: a response to them may be a bodiless 304.
+const VALIDATORS: [&str; 2] = ["if-none-match", "if-modified-since"];
+
+/// How the HTTP capture behind a document was obtained.
+#[derive(Clone, Copy, PartialEq)]
+enum Served {
+    Fetched,
+    Cached,
+    /// The site answered 304; the newest prior capture for the same request stands in.
+    NotModified,
+}
 
 #[derive(Clone)]
 pub struct Scraper {
     fetcher: Fetcher,
     store: Store,
     max_bytes: usize,
-    inflight: Arc<Mutex<HashMap<String, SharedFetch>>>,
+    inflight: Flights,
     browser: BrowserTier,
-    rendering: Arc<Mutex<HashMap<String, SharedRender>>>,
+    rendering: Flights,
 }
 
 impl Scraper {
@@ -197,7 +232,7 @@ impl Scraper {
     /// An explicit plan (actions, waits, screenshots) goes straight to the browser without
     /// cache reads or shared execution. Otherwise plain HTTP, escalating script shells; an
     /// origin that recently needed the browser goes browser-first. Automatic renders that fail
-    /// or do not help fall back to the HTTP result.
+    /// or do not help fall back to the HTTP result; a capture that cannot be stored fails.
     pub async fn scrape_with(
         &self,
         req: &ScrapeRequest,
@@ -210,48 +245,96 @@ impl Scraper {
         }
         let origin = url.origin().ascii_serialization();
         if self.browser.prefers(&origin)
-            && let Some(doc) = self.render_auto(&url, &headers, req, None).await
+            && let Some(doc) = self.render_auto(&url, &headers, req, None).await?
         {
             return Ok(doc);
         }
-        let (fetched, id, hit) = self.fetch_http(url.clone(), headers.clone(), req).await?;
+        // This caller's deadline bounds its cache reads and its wait on a shared fetch; the
+        // fetch itself carries on for other waiters.
+        let (fetched, id, served) = timeout_at(req.deadline, self.fetch_http(&url, &headers, req))
+            .await
+            .map_err(|_| FetchError::Timeout)??;
         if self.browser.is_enabled()
             && let Escalation::Render { visible } = policy::classify_http(&fetched)
-            && let Some(doc) = self.render_auto(&url, &headers, req, Some(visible)).await
+            && let Some(doc) = self.render_auto(&url, &headers, req, Some(visible)).await?
         {
             return Ok(doc);
         }
-        render_stored(fetched, id, req, hit).await
+        let mut doc = render_stored(fetched, id, req, served != Served::Fetched).await?;
+        if served == Served::NotModified {
+            let extra = &mut doc.rendered.metadata.extra;
+            extra.insert("notModified".into(), true.into());
+        }
+        Ok(doc)
     }
 
-    /// The HTTP capture and its ID: a fresh enough cached one (`true`), or a shared fetch.
+    /// The HTTP capture for this request. A 304 answers the caller's validators and has no
+    /// page to render: the newest prior capture for the same request stands in, or else the
+    /// request is sent once more without validators.
     async fn fetch_http(
         &self,
-        url: Url,
-        headers: Vec<(String, String)>,
+        url: &Url,
+        headers: &[(String, String)],
         req: &ScrapeRequest,
-    ) -> Result<(Fetched, i64, bool), ScrapeError> {
-        let mut key_material = url.to_string();
-        for (name, value) in &headers {
-            key_material.push_str(&format!("\n{name}: {value}"));
+    ) -> Result<(Fetched, i64, Served), ScrapeError> {
+        let key = http_key(url, headers);
+        let capture = self
+            .cached_or_fetched(key.clone(), url, headers, req)
+            .await?;
+        if capture.0.status != 304 {
+            return Ok(capture);
         }
-        // Hashed so header values (possibly credentials) never reach the database.
-        let key = store::sha256_hex(key_material.as_bytes());
+        match self.store.cached_capture(&key, Duration::MAX).await {
+            Ok(Some(prior)) => return Ok((prior.fetched, prior.id, Served::NotModified)),
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "capture cache unavailable"),
+        }
+        let plain: Vec<_> = headers
+            .iter()
+            .filter(|(name, _)| !VALIDATORS.contains(&name.as_str()))
+            .cloned()
+            .collect();
+        if plain.len() == headers.len() {
+            // A 304 to an unconditional request is a protocol violation, never an empty page.
+            return Err(FetchError::Protocol.into());
+        }
+        let key = http_key(url, &plain);
+        let capture = self.cached_or_fetched(key, url, &plain, req).await?;
+        if capture.0.status == 304 {
+            return Err(FetchError::Protocol.into());
+        }
+        Ok(capture)
+    }
+
+    /// A fresh enough cached capture, or a shared fetch stored before it resolves.
+    async fn cached_or_fetched(
+        &self,
+        key: String,
+        url: &Url,
+        headers: &[(String, String)],
+        req: &ScrapeRequest,
+    ) -> Result<(Fetched, i64, Served), ScrapeError> {
         if !req.max_age.is_zero() {
             match self.store.cached_capture(&key, req.max_age).await {
-                Ok(Some(capture)) => return Ok((capture.fetched, capture.id, true)),
+                Ok(Some(capture)) => return Ok((capture.fetched, capture.id, Served::Cached)),
                 Ok(None) => {}
                 Err(error) => tracing::warn!(%error, "capture cache unavailable"),
             }
         }
         let target = Target {
-            url,
-            headers,
+            url: url.clone(),
+            headers: headers.to_vec(),
             deadline: req.deadline,
             max_bytes: self.max_bytes,
         };
-        let (fetched, id) = self.fetch_once(key, target).await?;
-        Ok((fetched, id, false))
+        let (fetcher, store, flight_key) = (self.fetcher.clone(), self.store.clone(), key.clone());
+        let work = async move {
+            let fetched = fetcher.fetch(&target).await.map_err(FlightError::Fetch)?;
+            let id = store.put(&flight_key, &fetched).await.map_err(not_stored)?;
+            Ok((fetched, id))
+        };
+        let (fetched, id) = share(&self.inflight, key, work).await?;
+        Ok((fetched, id, Served::Fetched))
     }
 
     /// A caller-driven visit. Captures with actions are stored for the record under a key no
@@ -282,137 +365,121 @@ impl Scraper {
         Ok(doc)
     }
 
-    /// An automatic render from the rendered cache or a shared visit. It is used only when it
-    /// shows real text (and at least twice the HTTP text when escalating); success remembers
-    /// the origin, failure forgets it.
+    /// An automatic render from the rendered cache or a shared visit, bounded by this caller's
+    /// deadline. It is used only when it shows real text (and at least twice the HTTP text when
+    /// escalating); success remembers the origin, failure forgets it. A render that cannot be
+    /// stored fails the scrape rather than falling back.
     async fn render_auto(
         &self,
         url: &Url,
         headers: &[(String, String)],
         req: &ScrapeRequest,
         http_visible: Option<usize>,
-    ) -> Option<Document> {
+    ) -> Result<Option<Document>, ScrapeError> {
         let origin = url.origin().ascii_serialization();
         let key = self
             .browser
             .rendered_key(url, headers, &BrowserPlan::default());
-        let cached = if req.max_age.is_zero() {
-            None
-        } else {
-            self.store
-                .cached_capture(&key, req.max_age)
-                .await
-                .ok()
-                .flatten()
-        };
-        let (fetched, id, hit) = match cached {
-            Some(capture) => (capture.fetched, capture.id, true),
-            None => {
-                let render = self.render_once(key, url.clone(), headers.to_vec(), req.deadline);
-                match timeout_at(req.deadline, render).await {
-                    Ok(Ok((capture, id))) => (capture, id, false),
-                    _ => {
-                        self.browser.forget(&origin);
-                        return None;
-                    }
-                }
+        let capture = timeout_at(req.deadline, async {
+            if !req.max_age.is_zero()
+                && let Ok(Some(capture)) = self.store.cached_capture(&key, req.max_age).await
+            {
+                return Ok((capture.fetched, capture.id, true));
+            }
+            let (browser, store, flight_key) =
+                (self.browser.clone(), self.store.clone(), key.clone());
+            let (url, headers, deadline) = (url.clone(), headers.to_vec(), req.deadline);
+            let work = async move {
+                let output = browser
+                    .render(&url, &headers, deadline, &BrowserPlan::default())
+                    .await
+                    .map_err(FlightError::Browser)?;
+                let id = store
+                    .put_rendered(&flight_key, &output.capture)
+                    .await
+                    .map_err(not_stored)?;
+                Ok((output.capture, id))
+            };
+            let (fetched, id) = share(&self.rendering, key.clone(), work).await?;
+            Ok((fetched, id, false))
+        })
+        .await;
+        let (fetched, id, hit) = match capture {
+            Ok(Ok(capture)) => capture,
+            Ok(Err(FlightError::Storage)) => return Err(ScrapeError::Storage),
+            _ => {
+                self.browser.forget(&origin);
+                return Ok(None);
             }
         };
         let visible = policy::visible_chars(&fetched.text());
         if !policy::improves(http_visible.unwrap_or(0), visible) {
             self.browser.forget(&origin);
-            return None;
+            return Ok(None);
         }
         match render_stored(fetched, id, req, hit).await {
             Ok(doc) => {
                 self.browser.remember(&origin);
-                Some(doc)
+                Ok(Some(doc))
             }
             Err(_) => {
                 self.browser.forget(&origin);
-                None
+                Ok(None)
             }
         }
     }
+}
 
-    /// Identical concurrent automatic renders share one visit, stored before it resolves. Each
-    /// waiter still stops at its own deadline.
-    fn render_once(
-        &self,
-        key: String,
-        url: Url,
-        headers: Vec<(String, String)>,
-        deadline: Instant,
-    ) -> SharedRender {
-        let mut rendering = self
-            .rendering
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        if let Some(render) = rendering.get(&key) {
-            return render.clone();
-        }
-        let this = self.clone();
-        let task_key = key.clone();
-        let task = tokio::spawn(async move {
-            let result = async {
-                let output = this
-                    .browser
-                    .render(&url, &headers, deadline, &BrowserPlan::default())
-                    .await?;
-                let id = this
-                    .store
-                    .put_rendered(&task_key, &output.capture)
-                    .await
-                    .map_err(not_stored)?;
-                Ok((output.capture, id))
-            }
-            .await;
-            let mut rendering = this
-                .rendering
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            rendering.remove(&task_key);
-            result
-        });
-        let render = async move {
-            task.await
-                .unwrap_or(Err(BrowserError::Unavailable("render task failed")))
-        }
-        .boxed()
-        .shared();
-        rendering.insert(key, render.clone());
-        render
+/// Identical concurrent work shares one task. It runs on its own, so it completes (and stores
+/// its capture) even if every waiter leaves, and it ends by its own deadline.
+fn share(
+    flights: &Flights,
+    key: String,
+    work: impl Future<Output = Result<(Fetched, i64), FlightError>> + Send + 'static,
+) -> Flight {
+    let mut map = flights.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(flight) = map.get(&key) {
+        return flight.clone();
     }
+    let (flights_ref, task_key) = (Arc::clone(flights), key.clone());
+    let task = tokio::spawn(async move {
+        // Built on first poll, so a task dropped unpolled never locks the map held here.
+        let _landed = Landed {
+            flights: flights_ref,
+            key: task_key,
+        };
+        work.await
+    });
+    let flight = async move {
+        task.await
+            .unwrap_or(Err(FlightError::Fetch(FetchError::Protocol)))
+    }
+    .boxed()
+    .shared();
+    map.insert(key, flight.clone());
+    flight
+}
 
-    /// Identical concurrent misses share one fetch. It runs as its own task, so it completes
-    /// (and is stored) even if every waiting caller goes away, and it ends by its deadline.
-    fn fetch_once(&self, key: String, target: Target) -> SharedFetch {
-        let mut inflight = self.inflight.lock().unwrap_or_else(PoisonError::into_inner);
-        if let Some(fetch) = inflight.get(&key) {
-            return fetch.clone();
-        }
-        let this = self.clone();
-        let task_key = key.clone();
-        let task = tokio::spawn(async move {
-            let result = async {
-                let fetched = this.fetcher.fetch(&target).await?;
-                let id = this.store.put(&task_key, &fetched).await.map_err(|error| {
-                    tracing::error!(%error, "capture not stored");
-                    FetchError::Protocol
-                })?;
-                Ok((fetched, id))
-            }
-            .await;
-            let mut inflight = this.inflight.lock().unwrap_or_else(PoisonError::into_inner);
-            inflight.remove(&task_key);
-            result
-        });
-        let fetch = async move { task.await.unwrap_or(Err(FetchError::Protocol)) }
-            .boxed()
-            .shared();
-        inflight.insert(key, fetch.clone());
-        fetch
+/// Removes its single-flight entry when the task ends, whether it returns, errors, or panics.
+struct Landed {
+    flights: Flights,
+    key: String,
+}
+
+impl Drop for Landed {
+    fn drop(&mut self) {
+        let mut map = self.flights.lock().unwrap_or_else(PoisonError::into_inner);
+        map.remove(&self.key);
     }
+}
+
+/// Hashed so header values (possibly credentials) never reach the database.
+fn http_key(url: &Url, headers: &[(String, String)]) -> String {
+    let mut material = url.to_string();
+    for (name, value) in headers {
+        material.push_str(&format!("\n{name}: {value}"));
+    }
+    store::sha256_hex(material.as_bytes())
 }
 
 /// Missing scheme gets `http://`, as Firecrawl does; the fragment never reaches the server.
@@ -445,10 +512,10 @@ pub(crate) fn request_headers(
     Ok(valid)
 }
 
-/// A capture whose provenance is not recorded is not returned, as for plain fetches.
-fn not_stored(error: crate::store::StoreError) -> BrowserError {
-    tracing::error!(%error, "rendered capture not stored");
-    BrowserError::Unavailable("rendered capture not stored")
+/// A capture whose provenance is not recorded is never returned as a result.
+fn not_stored(error: crate::store::StoreError) -> FlightError {
+    tracing::error!(%error, "capture not stored");
+    FlightError::Storage
 }
 
 /// Renders a stored capture and records which capture it came from.
@@ -482,16 +549,17 @@ pub async fn render_capture(
                 .ends_with(".pdf"))
         || fetched.body.starts_with(b"%PDF-")
     {
-        let pdf = document::pdf_to_markdown(&fetched.body, req.deadline).await?;
-        let mut rendered = Rendered {
-            markdown: req.render.markdown.then_some(pdf.markdown),
-            ..Rendered::default()
-        };
-        rendered.metadata.title = pdf.title;
-        rendered
-            .metadata
-            .extra
-            .insert("numPages".into(), pdf.pages.to_string());
+        let (mut rendered, mut warning) = (Rendered::default(), None);
+        if req.render.skip_pdf_parsing {
+            rendered.markdown = req.render.markdown.then(String::new);
+            warning = Some("PDF parsing disabled".to_owned());
+        } else {
+            let pdf = document::pdf_to_markdown(&fetched.body, req.deadline).await?;
+            rendered.markdown = req.render.markdown.then_some(pdf.markdown);
+            rendered.metadata.title = pdf.title;
+            let pages = pdf.pages.into();
+            rendered.metadata.extra.insert("numPages".into(), pages);
+        }
         return Ok(Document {
             capture_id: None,
             blob_sha256,
@@ -502,6 +570,7 @@ pub async fn render_capture(
             cached_at: hit.then_some(fetched.fetched_at),
             rendered,
             raw_html: None,
+            warning,
             browser: BrowserExtras::default(),
         });
     }
@@ -531,6 +600,7 @@ pub async fn render_capture(
         cached_at: hit.then_some(fetched.fetched_at),
         rendered,
         raw_html: req.raw_html.then_some(text),
+        warning: None,
         browser: BrowserExtras::default(),
     })
 }

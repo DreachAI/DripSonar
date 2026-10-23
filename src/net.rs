@@ -273,7 +273,8 @@ fn retry_after(response: &reqwest::Response, deadline: Instant) -> Option<Durati
     // shortcut: delta-seconds only; an HTTP-date Retry-After is returned as observed.
     let value = response.headers().get(reqwest::header::RETRY_AFTER)?;
     let wait = Duration::from_secs(value.to_str().ok()?.trim().parse().ok()?);
-    (Instant::now() + wait < deadline).then_some(wait)
+    // Compared, never added, so an absurd value cannot overflow the clock.
+    (wait < deadline.saturating_duration_since(Instant::now())).then_some(wait)
 }
 
 /// Reads the body, refusing it once its decoded size passes `target.max_bytes`.

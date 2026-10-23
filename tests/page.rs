@@ -59,7 +59,7 @@ fn renders_main_content_metadata_and_links() {
     assert_eq!(m.dc_date.as_deref(), Some("2024-02-01"));
     assert_eq!(m.modified_time, None);
     assert_eq!(
-        m.extra.get("twitter:card").map(String::as_str),
+        m.extra.get("twitter:card").and_then(|v| v.as_str()),
         Some("summary")
     );
 }

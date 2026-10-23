@@ -2,6 +2,8 @@
 
 mod db;
 mod sched;
+mod webhooks;
+pub use webhooks::Webhook;
 
 use serde::{Deserialize, Serialize};
 use std::{
@@ -38,6 +40,9 @@ use crate::{
 const STORE_SWEEP_EVERY: Duration = Duration::from_secs(3600);
 
 pub type JobId = uuid::Uuid;
+/// The HTTP boundary supplies wire serialization; jobs do not depend on API types.
+pub type DocumentEncoder =
+    fn(&Document, &serde_json::Value, &str) -> Result<serde_json::Value, StoreError>;
 
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
@@ -72,6 +77,10 @@ pub struct JobSpec {
     pub delay_ms: Option<u64>,
     #[serde(default)]
     pub seed_origin: Option<String>,
+    #[serde(default)]
+    pub webhook: Option<Webhook>,
+    #[serde(default)]
+    pub change_tracking: Option<crate::scrape::ChangeTrackingOptions>,
 }
 
 pub struct Seed {
@@ -117,6 +126,7 @@ struct Inner {
     scraper: Scraper,
     fetcher: Fetcher,
     cfg: Config,
+    document_encoder: DocumentEncoder,
     stopped: AtomicBool,
     stop: Notify,
     _lock: File,
@@ -137,6 +147,7 @@ pub(super) struct Work {
     /// Leases so far, including this one.
     attempts: u32,
     spec: JobSpec,
+    formats: serde_json::Value,
 }
 
 pub(super) struct Outcome {
@@ -156,6 +167,7 @@ impl Jobs {
         scraper: Scraper,
         fetcher: Fetcher,
         cfg: &Config,
+        document_encoder: DocumentEncoder,
     ) -> Result<(Self, JoinHandle<()>), JobError> {
         let lock = OpenOptions::new()
             .read(true)
@@ -177,6 +189,7 @@ impl Jobs {
                 scraper,
                 fetcher,
                 cfg: cfg.clone(),
+                document_encoder,
                 stopped: AtomicBool::new(false),
                 stop: Notify::new(),
                 _lock: lock,
@@ -185,6 +198,7 @@ impl Jobs {
         };
         let dispatcher = tokio::spawn(this.clone().dispatch(receive, active));
         tokio::spawn(sweep_store(Arc::downgrade(&this.inner)));
+        tokio::spawn(webhooks::deliver(Arc::downgrade(&this.inner)));
         Ok((this, dispatcher))
     }
 
@@ -207,6 +221,11 @@ impl Jobs {
         }
         crate::scrape::request_headers(&spec.scrape.headers)
             .map_err(|error| JobError::Invalid(error.to_string()))?;
+        if let Some(webhook) = &spec.webhook {
+            webhook
+                .validate(&self.inner.fetcher)
+                .map_err(JobError::Invalid)?;
+        }
         if !self
             .inner
             .store
@@ -240,6 +259,9 @@ impl Jobs {
         max_bytes: usize,
     ) -> Result<Option<StatusPage>, JobError> {
         Ok(db::status(&self.inner.store, id, kind, skip, max_docs, max_bytes).await?)
+    }
+    pub async fn active_crawls(&self) -> Result<Vec<serde_json::Value>, JobError> {
+        Ok(db::active_crawls(&self.inner.store).await?)
     }
     pub async fn errors(
         &self,
@@ -452,7 +474,20 @@ impl Jobs {
             Task::Page => {
                 request.render.links = true;
                 request.render.markdown = true;
-                match self.inner.scraper.scrape(&request).await {
+                let scraped = async {
+                    let mut doc = self.inner.scraper.scrape(&request).await?;
+                    if let Some(options) = &work.spec.change_tracking {
+                        doc.change_tracking = Some(
+                            self.inner
+                                .scraper
+                                .track_changes(&doc, &request, options)
+                                .await?,
+                        );
+                    }
+                    Ok::<_, ScrapeError>(doc)
+                }
+                .await;
+                match scraped {
                     Ok(doc) => {
                         if work.spec.scope.is_some() {
                             out.links = doc
@@ -519,6 +554,7 @@ impl Jobs {
                                     work,
                                     out,
                                     self.inner.cfg.job_retention_hours,
+                                    self.inner.document_encoder,
                                 )
                                 .await;
                             }
@@ -574,6 +610,7 @@ impl Jobs {
             work,
             out,
             self.inner.cfg.job_retention_hours,
+            self.inner.document_encoder,
         )
         .await
     }

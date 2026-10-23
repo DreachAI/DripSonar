@@ -119,6 +119,11 @@ impl AppState {
             self.scraper.clone(),
             self.fetcher.clone(),
             &self.job_config,
+            |doc, formats, url| {
+                let formats: Vec<Format> =
+                    serde_json::from_value(formats.clone()).map_err(|_| StoreError::Corrupt)?;
+                Ok(Value::Object(document_json(doc, &formats, url)))
+            },
         )
         .await?;
         self.jobs = Some(jobs);
@@ -156,6 +161,16 @@ impl AppState {
             .clone()
             .unwrap_or_else(|| default_formats.to_vec());
         let extraction = formats.contains(&Format::Json) || formats.contains(&Format::Summary);
+        if formats.contains(&Format::ChangeTracking) && !formats.contains(&Format::Markdown) {
+            return Err(ApiError::bad_request(
+                "changeTracking requires the markdown format",
+            ));
+        }
+        if opts.change_tracking_options.is_some() && !formats.contains(&Format::ChangeTracking) {
+            return Err(ApiError::bad_request(
+                "changeTrackingOptions requires changeTracking",
+            ));
+        }
         if extraction {
             self.extractor()?;
         }
@@ -203,8 +218,18 @@ impl AppState {
         formats: &[Format],
         source_url: &str,
         opts: &ScrapeOptions,
+        deadline: Instant,
     ) -> Result<Map<String, Value>, ApiError> {
         let mut data = document_json(doc, formats, source_url);
+        if formats.contains(&Format::ChangeTracking) {
+            let (mut request, _) = self.plan(opts, formats)?;
+            request.deadline = deadline;
+            let options = opts.change_tracking_options.clone().unwrap_or_default();
+            data.insert(
+                "changeTracking".into(),
+                self.scraper.track_changes(doc, &request, &options).await?,
+            );
+        }
         let mut usage = Usage::default();
         let mut warning = doc.warning.clone();
         for format in [Format::Json, Format::Summary] {
@@ -319,6 +344,7 @@ pub(crate) enum Format {
     Links,
     Json,
     Summary,
+    ChangeTracking,
     Screenshot,
     #[serde(rename = "screenshot@fullPage")]
     ScreenshotFullPage,
@@ -348,6 +374,7 @@ struct ScrapeOptions {
     url: Option<String>,
     formats: Option<Vec<Format>>,
     json_options: Option<JsonOptions>,
+    change_tracking_options: Option<scrape::ChangeTrackingOptions>,
     only_main_content: Option<bool>,
     #[serde(default)]
     include_tags: Vec<String>,
@@ -386,6 +413,9 @@ struct SearchBody {
     query: String,
     limit: Option<usize>,
     lang: Option<String>,
+    tbs: Option<String>,
+    #[serde(default)]
+    sources: Vec<String>,
     timeout: Option<u64>,
     #[serde(default)]
     scrape_options: ScrapeOptions,
@@ -473,6 +503,7 @@ impl From<BrowserError> for ApiError {
 impl From<SearchError> for ApiError {
     fn from(error: SearchError) -> Self {
         let (status, code) = match error {
+            SearchError::Invalid(_) => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
             SearchError::Timeout => (StatusCode::REQUEST_TIMEOUT, "SCRAPE_TIMEOUT"),
             SearchError::AllProvidersFailed => (StatusCode::INTERNAL_SERVER_ERROR, "SEARCH_FAILED"),
         };
@@ -504,7 +535,7 @@ async fn scrape(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
     state.ensure_storage().await?;
     let doc = state.scraper.scrape_with(&request, &plan).await?;
     let data = state
-        .extracted_document(&doc, &formats, &request.url, &opts)
+        .extracted_document(&doc, &formats, &request.url, &opts, request.deadline)
         .await?;
     Ok(Json(json!({"success": true, "data": data})))
 }
@@ -525,9 +556,11 @@ async fn search(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
     let scrape_timeout = state.timeout(body.scrape_options.timeout, SCRAPE_TIMEOUT_MS)?;
     let plan = browser_plan(&body.scrape_options, &formats)?;
     let lang = body.lang.as_deref().unwrap_or("en");
+    let filters = crate::search::SearchFilters::parse(body.tbs.as_deref(), &body.sources)
+        .map_err(ApiError::bad_request)?;
     let hits = state
         .searcher
-        .search(&body.query, limit, lang, deadline)
+        .search_filtered(&body.query, limit, lang, deadline, filters)
         .await?;
     if hits.is_empty() {
         let warning = "No search results found";
@@ -551,7 +584,7 @@ async fn search(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
                 match scraper.scrape_with(&request, plan).await {
                     Ok(doc) => item.extend(
                         state
-                            .extracted_document(&doc, formats, &hit.url, options)
+                            .extracted_document(&doc, formats, &hit.url, options, request.deadline)
                             .await?,
                     ),
                     Err(error) => {
@@ -685,6 +718,7 @@ pub(crate) fn document_json(
             Format::Links => ("links", json!(rendered.links.clone().unwrap_or_default())),
             Format::Json => ("json", Value::Null),
             Format::Summary => ("summary", Value::Null),
+            Format::ChangeTracking => ("changeTracking", json!(doc.change_tracking)),
             Format::Screenshot | Format::ScreenshotFullPage => {
                 ("screenshot", json!(doc.browser.screenshot))
             }

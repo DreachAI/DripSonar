@@ -16,6 +16,7 @@ pub(super) fn routes() -> Router<AppState> {
     Router::new()
         .route("/v1/map", post(map))
         .route("/v1/crawl", post(crawl_start))
+        .route("/v1/crawl/active", get(crawl_active))
         .route("/v1/crawl/{id}", get(crawl_status).delete(crawl_cancel))
         .route("/v1/crawl/{id}/errors", get(crawl_errors))
         .route("/v1/batch/scrape", post(batch_start))
@@ -144,6 +145,7 @@ struct CrawlBody {
     delay: Option<f64>,
     #[serde(default)]
     scrape_options: ScrapeOptions,
+    webhook: Option<crate::jobs::Webhook>,
     #[serde(rename = "maxConcurrency")]
     _max_concurrency: Option<u32>,
     #[serde(rename = "deduplicateSimilarURLs")]
@@ -204,6 +206,13 @@ pub(super) async fn crawl_start(
         limit: body.limit.unwrap_or(10_000),
         delay_ms,
         seed_origin: Some(seed.origin().ascii_serialization()),
+        webhook: body.webhook,
+        change_tracking: formats.contains(&Format::ChangeTracking).then(|| {
+            body.scrape_options
+                .change_tracking_options
+                .clone()
+                .unwrap_or_default()
+        }),
     };
     let mut seeds = vec![Seed {
         url: seed.clone(),
@@ -253,6 +262,7 @@ pub(super) async fn batch_start(
     let urls: Vec<String> =
         take(&mut body, "urls")?.ok_or_else(|| ApiError::bad_request("urls is required"))?;
     let ignore_invalid = take::<bool>(&mut body, "ignoreInvalidURLs")?.unwrap_or(false);
+    let webhook = take::<crate::jobs::Webhook>(&mut body, "webhook")?;
     let _ = take::<u32>(&mut body, "maxConcurrency")?;
     let _ = take::<bool>(&mut body, "deduplicateSimilarURLs")?;
     let opts: ScrapeOptions = serde_json::from_value(Value::Object(body))
@@ -296,6 +306,10 @@ pub(super) async fn batch_start(
         limit: seeds.len() as u32,
         delay_ms: None,
         seed_origin: None,
+        webhook,
+        change_tracking: formats
+            .contains(&Format::ChangeTracking)
+            .then(|| opts.change_tracking_options.clone().unwrap_or_default()),
     };
     let base = public_url(&state, &headers, "/v1/batch/scrape")?;
     let id = jobs(&state)?
@@ -311,6 +325,11 @@ pub(super) async fn batch_start(
 pub(super) struct Pagination {
     skip: Option<u64>,
     limit: Option<usize>,
+}
+
+pub(super) async fn crawl_active(State(state): State<AppState>) -> Reply {
+    let crawls = jobs(&state)?.active_crawls().await?;
+    Ok(Json(json!({"success": true, "crawls": crawls})))
 }
 
 async fn status(

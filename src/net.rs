@@ -182,6 +182,54 @@ impl Fetcher {
             .unwrap_or(Err(FetchError::Timeout))
     }
 
+    /// One guarded POST, without redirects or transport retries. The durable outbox owns
+    /// retries; a timeout can mean the receiver accepted the event already.
+    pub async fn post_json(
+        &self,
+        url: &Url,
+        headers: &[(String, String)],
+        body: &[u8],
+        deadline: Instant,
+    ) -> Result<u16, FetchError> {
+        let deadline = deadline.min(Instant::now() + Duration::from_secs(10));
+        timeout_at(deadline, async {
+            self.guard
+                .check_url(url)
+                .map_err(|refusal| FetchError::Refused(refusal.0))?;
+            let _pass = self
+                .gate
+                .enter(url.host_str().unwrap_or_default(), deadline)
+                .await?;
+            let route = self.routes.route_for(url.host_str().unwrap_or_default());
+            self.routes
+                .check_budget(route)
+                .map_err(|error| FetchError::Refused(error.to_string()))?;
+            let client = match route {
+                Route::Direct => &self.client,
+                Route::Proxy => self.proxy_client.as_ref().ok_or(FetchError::Protocol)?,
+            };
+            let mut request = client
+                .post(url.clone())
+                .timeout(deadline.saturating_duration_since(Instant::now()))
+                .header(reqwest::header::CONTENT_TYPE, "application/json");
+            for (name, value) in headers {
+                request = request.header(name, value);
+            }
+            self.routes
+                .charge(route, body.len())
+                .map_err(|error| FetchError::Refused(error.to_string()))?;
+            let response = request
+                .body(body.to_vec())
+                .send()
+                .await
+                .map_err(|error| classify(&error, url))?;
+            // No response body is needed; dropping it bounds hostile response sizes.
+            Ok(response.status().as_u16())
+        })
+        .await
+        .unwrap_or(Err(FetchError::Timeout))
+    }
+
     async fn follow(&self, target: &Target) -> Result<Fetched, FetchError> {
         let mut url = target.url.clone();
         for _ in 0..=MAX_REDIRECTS {

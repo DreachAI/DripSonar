@@ -45,6 +45,8 @@ pub struct Config {
     pub data_dir: PathBuf,
     #[arg(long, env = "SONAR_API_KEY", hide_env_values = true)]
     pub api_key: Option<Secret>,
+    #[arg(long, env = "SONAR_WEBHOOK_SECRET", hide_env_values = true)]
+    pub webhook_secret: Option<Secret>,
     // Kept out of Config's Debug output, including the provider credential.
     #[command(flatten)]
     pub llm: crate::extract::LlmConfig,

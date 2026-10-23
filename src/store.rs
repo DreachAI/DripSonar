@@ -37,6 +37,10 @@ CREATE TABLE IF NOT EXISTS captures (
 CREATE INDEX IF NOT EXISTS captures_by_key ON captures (cache_key, fetched_at_ms);
 CREATE INDEX IF NOT EXISTS captures_by_time ON captures (fetched_at_ms);
 CREATE INDEX IF NOT EXISTS captures_by_blob ON captures (blob_sha256);
+CREATE INDEX IF NOT EXISTS captures_by_requested ON captures (requested_url, fetched_at_ms, id)
+    WHERE status BETWEEN 200 AND 299;
+CREATE INDEX IF NOT EXISTS captures_by_final ON captures (final_url, fetched_at_ms, id)
+    WHERE status BETWEEN 200 AND 299;
 CREATE TABLE IF NOT EXISTS searches (
     id INTEGER PRIMARY KEY,
     query TEXT NOT NULL,
@@ -307,6 +311,41 @@ impl Store {
             }
         })
         .await
+    }
+
+    /// Newest successful capture of either URL, strictly before the current capture. Using the
+    /// stored time and ID also excludes captures written by concurrent, later scrapes.
+    pub async fn previous_capture(
+        &self,
+        current: i64,
+        before: Option<i64>,
+    ) -> Result<Option<Capture>, StoreError> {
+        let blobs = self.blobs.clone();
+        self.read(move |conn| {
+            let present: bool = conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM captures WHERE id=?1)
+                 AND EXISTS(SELECT 1 FROM captures WHERE id=COALESCE(?2,?1))",
+                params![current, before], |row| row.get(0))?;
+            if !present { return Err(StoreError::Corrupt); }
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {CAPTURE_COLUMNS} FROM captures WHERE status BETWEEN 200 AND 299
+                 AND (fetched_at_ms,id) < (SELECT fetched_at_ms,id FROM captures WHERE id=COALESCE(?2,?1))
+                 AND (requested_url IN (SELECT requested_url FROM captures WHERE id=?1
+                      UNION SELECT final_url FROM captures WHERE id=?1)
+                   OR final_url IN (SELECT requested_url FROM captures WHERE id=?1
+                      UNION SELECT final_url FROM captures WHERE id=?1))
+                 AND NOT EXISTS(SELECT 1 FROM searches WHERE capture_id=captures.id)
+                 ORDER BY fetched_at_ms DESC,id DESC LIMIT 64"
+            ))?;
+            let mut rows = stmt.query(params![current, before])?;
+            let mut missing = 0;
+            while let Some(row) = rows.next()? {
+                if let Some(capture) = read_capture(&blobs, row)? { return Ok(Some(capture)); }
+                missing += 1;
+            }
+            // Do not call unavailable history a new page. Bound work on damaged stores.
+            if missing > 0 { Err(StoreError::Corrupt) } else { Ok(None) }
+        }).await
     }
 
     /// Page captures (not search exchanges) after `after_id` in ID order, and the cursor for the

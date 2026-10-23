@@ -25,10 +25,50 @@ pub struct Hit {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
+    #[error("{0}")]
+    Invalid(String),
     #[error("all search providers failed")]
     AllProvidersFailed,
     #[error("deadline exceeded")]
     Timeout,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct SearchFilters {
+    time_range: Option<TimeRange>,
+    news: bool,
+}
+
+#[derive(Clone, Copy)]
+enum TimeRange {
+    Day,
+    Week,
+    Month,
+    Year,
+}
+
+impl SearchFilters {
+    pub fn parse(tbs: Option<&str>, sources: &[String]) -> Result<Self, String> {
+        let time_range = match tbs {
+            None | Some("") => None,
+            Some("qdr:h" | "qdr:d") => Some(TimeRange::Day),
+            Some("qdr:w") => Some(TimeRange::Week),
+            Some("qdr:m") => Some(TimeRange::Month),
+            Some("qdr:y") => Some(TimeRange::Year),
+            _ => return Err("tbs must be qdr:h, qdr:d, qdr:w, qdr:m, or qdr:y".into()),
+        };
+        if sources
+            .iter()
+            .any(|source| !matches!(source.as_str(), "web" | "news"))
+        {
+            return Err("sources must contain web or news".into());
+        }
+        let news = sources.iter().any(|source| source == "news");
+        if news && sources.iter().any(|source| source == "web") {
+            return Err("sources must select either web or news, not both".into());
+        }
+        Ok(Self { time_range, news })
+    }
 }
 
 pub fn parse_searxng(body: &[u8]) -> Result<Vec<Hit>, SearchError> {
@@ -247,6 +287,23 @@ impl Searcher {
         lang: &str,
         deadline: Instant,
     ) -> Result<Vec<Hit>, SearchError> {
+        self.search_filtered(query, limit, lang, deadline, SearchFilters::default())
+            .await
+    }
+
+    pub async fn search_filtered(
+        &self,
+        query: &str,
+        limit: usize,
+        lang: &str,
+        deadline: Instant,
+        filters: SearchFilters,
+    ) -> Result<Vec<Hit>, SearchError> {
+        if filters.news && self.searxng.is_none() {
+            return Err(SearchError::Invalid(
+                "news source requires SEARXNG_ENDPOINT".into(),
+            ));
+        }
         let searxng = self.searxng.as_ref();
         let mut exchanges = Vec::new();
         let result = run_chain(
@@ -255,6 +312,7 @@ impl Searcher {
             limit,
             lang,
             deadline,
+            filters,
             |target| async move {
                 match searxng {
                     Some((endpoint, client)) if target.url.origin() == endpoint.origin() => {
@@ -378,7 +436,13 @@ impl Provider<'_> {
         }
     }
 
-    fn url(self, query: &str, lang: &str, page: u32) -> Result<Url, SearchError> {
+    fn url(
+        self,
+        query: &str,
+        lang: &str,
+        page: u32,
+        filters: SearchFilters,
+    ) -> Result<Url, SearchError> {
         let mut url = match self {
             Self::Searxng(endpoint) => {
                 let mut url = endpoint.clone();
@@ -400,11 +464,38 @@ impl Provider<'_> {
                     .append_pair("format", "json")
                     .append_pair("language", lang)
                     .append_pair("pageno", &page.to_string());
+                if filters.news {
+                    params.append_pair("categories", "news");
+                }
+                if let Some(range) = filters.time_range {
+                    params.append_pair(
+                        "time_range",
+                        match range {
+                            TimeRange::Day => "day",
+                            TimeRange::Week => "week",
+                            TimeRange::Month => "month",
+                            TimeRange::Year => "year",
+                        },
+                    );
+                }
             }
             Self::Brave => {
                 params.append_pair("source", "web");
             }
-            Self::DuckDuckGo | Self::Mojeek => {}
+            Self::DuckDuckGo => {
+                if let Some(range) = filters.time_range {
+                    params.append_pair(
+                        "df",
+                        match range {
+                            TimeRange::Day => "d",
+                            TimeRange::Week => "w",
+                            TimeRange::Month => "m",
+                            TimeRange::Year => "y",
+                        },
+                    );
+                }
+            }
+            Self::Mojeek => {}
         }
         drop(params);
         Ok(url)
@@ -427,6 +518,7 @@ async fn run_chain<F, Fut>(
     limit: usize,
     lang: &str,
     deadline: Instant,
+    filters: SearchFilters,
     mut fetch: F,
     // Each provider response: its name, the response, and its hits when it parsed.
     mut record: impl FnMut(&'static str, &Fetched, Option<&[Hit]>),
@@ -445,6 +537,11 @@ where
         .map(Provider::Searxng)
         .into_iter()
         .chain([Provider::DuckDuckGo, Provider::Mojeek, Provider::Brave])
+        .filter(|provider| match provider {
+            Provider::Searxng(_) => true,
+            Provider::DuckDuckGo => !filters.news,
+            Provider::Mojeek | Provider::Brave => !filters.news && filters.time_range.is_none(),
+        })
         .collect();
     let mut providers_left = providers.len() as u32;
     for provider in providers {
@@ -461,7 +558,7 @@ where
                 break;
             }
             let target = Target {
-                url: provider.url(query, lang, page)?,
+                url: provider.url(query, lang, page, filters)?,
                 headers: Vec::new(),
                 deadline: provider_deadline,
                 max_bytes: MAX_RESPONSE_BYTES,
@@ -545,6 +642,7 @@ mod tests {
                 10,
                 "en",
                 deadline,
+                SearchFilters::default(),
                 |target| {
                     calls += 1;
                     assert_eq!(target.deadline, deadline);
@@ -600,6 +698,7 @@ mod tests {
                 limit,
                 "en",
                 Instant::now() + Duration::from_secs(5),
+                SearchFilters::default(),
                 |target| {
                     calls += 1;
                     assert_eq!(
@@ -644,6 +743,7 @@ mod tests {
                 limit,
                 "en",
                 deadline,
+                SearchFilters::default(),
                 |_| {
                     panic!("no fetch should start");
                     #[allow(unreachable_code)]
@@ -664,6 +764,7 @@ mod tests {
             10,
             "en",
             Instant::now() + Duration::from_millis(5),
+            SearchFilters::default(),
             |_| std::future::pending::<Result<Fetched, FetchError>>(),
             |_, _, _| {},
         )

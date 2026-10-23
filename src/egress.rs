@@ -5,6 +5,7 @@ mod guard;
 
 use std::{
     fmt,
+    path::PathBuf,
     sync::{Arc, Mutex, PoisonError},
     time::Duration,
 };
@@ -104,16 +105,28 @@ impl RouteConfig {
                 "forward proxy concurrency must be supported and idle timeout must be 1..=86400000 ms",
             ));
         }
+        let budget = Budget::load(
+            cfg.data_dir.join("proxy-usage.json"),
+            cfg.proxy_max_bytes_per_day,
+        )?;
+        if upstream.is_some() {
+            let budget = Arc::downgrade(&budget);
+            std::thread::Builder::new()
+                .name("proxy-usage".into())
+                .spawn(move || loop {
+                    std::thread::sleep(Duration::from_secs(5));
+                    let Some(budget) = budget.upgrade() else { break };
+                    let mut state = budget.state.lock().unwrap_or_else(PoisonError::into_inner);
+                    if budget.flush(&mut state).is_err() {
+                        tracing::error!("proxy usage could not be persisted; proxy traffic refused until recovery");
+                    }
+                })
+                .map_err(|_| EgressError::Config("cannot start proxy usage writer"))?;
+        }
         Ok(Self {
             upstream,
             hosts: hosts.into(),
-            budget: Arc::new(Budget {
-                limit: cfg.proxy_max_bytes_per_day,
-                state: Mutex::new(DailyUsage {
-                    day: utc_day(),
-                    bytes: 0,
-                }),
-            }),
+            budget,
             concurrency: cfg.forward_proxy_concurrency,
             idle_timeout: Duration::from_millis(cfg.forward_proxy_idle_timeout_ms),
         })
@@ -160,15 +173,24 @@ impl RouteConfig {
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
         let day = utc_day();
-        if state.day != day {
-            *state = DailyUsage { day, bytes: 0 };
+        if state.usage.utc_day != day {
+            state.usage = DailyUsage {
+                utc_day: day,
+                bytes: 0,
+            };
         }
-        let previous = state.bytes;
-        state.bytes = state.bytes.saturating_add(bytes as u64);
+        let previous = state.usage.bytes;
+        state.usage.bytes = state.usage.bytes.saturating_add(bytes as u64);
+        if state.failed
+            || state.usage.utc_day != state.saved.utc_day
+            || state.usage.bytes.saturating_sub(state.saved.bytes) >= 8 * 1024 * 1024
+        {
+            self.budget.flush(&mut state)?;
+        }
         if self
             .budget
             .limit
-            .is_some_and(|limit| previous >= limit || state.bytes > limit)
+            .is_some_and(|limit| previous >= limit || state.usage.bytes > limit)
         {
             return Err(EgressError::BudgetExhausted);
         }
@@ -178,12 +200,76 @@ impl RouteConfig {
 
 struct Budget {
     limit: Option<u64>,
-    state: Mutex<DailyUsage>,
+    path: PathBuf,
+    state: Mutex<BudgetState>,
 }
 
+struct BudgetState {
+    usage: DailyUsage,
+    saved: DailyUsage,
+    failed: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 struct DailyUsage {
-    day: i64,
+    utc_day: i64,
     bytes: u64,
+}
+
+impl Budget {
+    fn load(path: PathBuf, limit: Option<u64>) -> Result<Arc<Self>, EgressError> {
+        let usage = match std::fs::read(&path) {
+            Ok(bytes) => serde_json::from_slice(&bytes)
+                .map_err(|_| EgressError::Config("invalid proxy usage file"))?,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => DailyUsage {
+                utc_day: utc_day(),
+                bytes: 0,
+            },
+            Err(_) => return Err(EgressError::Config("cannot read proxy usage file")),
+        };
+        Ok(Arc::new(Self {
+            limit,
+            path,
+            state: Mutex::new(BudgetState {
+                usage,
+                saved: usage,
+                failed: false,
+            }),
+        }))
+    }
+
+    fn flush(&self, state: &mut BudgetState) -> Result<(), EgressError> {
+        if state.usage == state.saved && !state.failed {
+            return Ok(());
+        }
+        let write = || -> std::io::Result<()> {
+            if let Some(parent) = self.path.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let temp = self.path.with_extension("json.tmp");
+            std::fs::write(
+                &temp,
+                serde_json::to_vec(&state.usage).map_err(std::io::Error::other)?,
+            )?;
+            std::fs::rename(temp, &self.path)?;
+            Ok(())
+        };
+        state.failed = write().is_err();
+        if state.failed {
+            return Err(EgressError::Config("cannot persist proxy usage"));
+        }
+        state.saved = state.usage;
+        Ok(())
+    }
+}
+
+impl Drop for Budget {
+    fn drop(&mut self) {
+        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
+        if self.flush(&mut state).is_err() {
+            tracing::error!("proxy usage could not be persisted at shutdown");
+        }
+    }
 }
 
 fn utc_day() -> i64 {
@@ -205,7 +291,7 @@ impl Upstream {
                 "SONAR_PROXY must be a socks5:// endpoint; socks5h:// and HTTP proxies are refused",
             )
         };
-        let url = Url::parse(input).map_err(|_| invalid())?;
+        let mut url = Url::parse(input).map_err(|_| invalid())?;
         if url.scheme() != "socks5"
             || url.host().is_none()
             || url.port() == Some(0)
@@ -225,6 +311,36 @@ impl Upstream {
             return Err(EgressError::Config(
                 "invalid SONAR_PROXY SOCKS5 credentials",
             ));
+        }
+        if let Some(url::Host::Domain(host)) = url.host()
+            && host.parse::<std::net::IpAddr>().is_err()
+        {
+            let mut destination = Url::parse("https://proxy.invalid/").map_err(|_| invalid())?;
+            destination.set_host(Some(host)).map_err(|_| invalid())?;
+            // Resolve on a startup-only runtime, even when the caller already runs in Tokio.
+            let addresses = std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .map_err(|_| EgressError::Config("cannot start proxy DNS resolver"))?;
+                runtime.block_on(async {
+                    tokio::time::timeout(
+                        Duration::from_secs(10),
+                        FetchGuard::new(&[]).resolve_url(&destination),
+                    )
+                    .await
+                    .map_err(|_| EgressError::Config("proxy DNS resolution timed out"))?
+                    .map_err(|_| {
+                        EgressError::Config("proxy hostname must resolve to public addresses")
+                    })
+                })
+            })
+            .join()
+            .map_err(|_| EgressError::Config("proxy DNS resolver failed"))??;
+            let address = addresses
+                .first()
+                .ok_or(EgressError::Config("proxy hostname has no addresses"))?;
+            url.set_ip_host(address.ip()).map_err(|_| invalid())?;
         }
         Ok(Self {
             url,

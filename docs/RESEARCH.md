@@ -65,6 +65,41 @@ Inspected revision `e0b48886c3f334864b00f1fd62c211fd51ac2910`; see the
 
 No upstream code, dependencies, services, or browser sessions were executed for this inspection.
 
+Firecrawl's proxy model, from the same checkout: self-hosting takes one `PROXY_SERVER` that the
+browser service and document downloads route through (`apps/playwright-service-ts/api.ts`).
+The hosted API exposes `proxy: basic | stealth | enhanced | auto` and reports `proxyUsed`
+(`apps/js-sdk/firecrawl/src/v2/types.ts`). With `proxy: auto`, a 401, 403, or 429 response adds a
+`stealthProxy` feature and retries (`apps/api/src/scraper/scrapeURL/index.ts`); the hosted proxy
+network behind that flag is not in the open source.
+
+## Practitioner reports
+
+Collected 2026-10-22 from about 110 Reddit threads (via the Arctic Shift archive; reddit.com
+refused this client) and 80 Hacker News threads, 2024 onward, summarized per topic and spot-checked
+against the downloaded threads. These are forum anecdotes, not measurements or legal advice.
+Vendor self-promotion was discounted. Each line notes how widely commenters agreed.
+
+| Topic | What practitioners reported | Agreement |
+| --- | --- | --- |
+| Access cost | The expensive part is getting past blocking (proxies, challenges, browsers), not extraction ([HN](https://news.ycombinator.com/item?id=47117886)) | 2-3 |
+| Source order | Look for an official API, feed, hidden JSON endpoint, or JSON-LD before HTML, and a browser last ([1](https://www.reddit.com/comments/1kjvv68), [2](https://www.reddit.com/comments/1rffmmh)); the endpoints may sit behind the same firewall | many |
+| Egress | Datacenter and AWS ranges carry poor reputation ([HN](https://news.ycombinator.com/item?id=46802748)); a residential IP does not fix a wrong TLS or browser fingerprint ([1](https://www.reddit.com/comments/1tn9rcu), [2](https://www.reddit.com/comments/1ps6f1g)) | 2-3 |
+| Sessions | Cookies, TLS profile, user agent, locale, and exit IP must stay together; clearance cookies fail on another profile ([1](https://www.reddit.com/comments/1rffmmh), [2](https://www.reddit.com/comments/1o9vf3r)) | 2-3 |
+| Residential pools | Many are sourced through SDKs in consumer apps and devices; provenance is an ethical and supply risk ([1](https://news.ycombinator.com/item?id=49000864), [2](https://news.ycombinator.com/item?id=48635954)) | many |
+| Stealth tooling | TLS impersonation (curl_cffi, wreq) helps and then breaks; closed patched browsers raise trust questions ([1](https://www.reddit.com/comments/1u44li3), [2](https://www.reddit.com/comments/1rc9992)) | 2-3 |
+| Maintenance | One operator reports 10-15% of scrapers breaking weekly ([1](https://www.reddit.com/comments/1kceext)); separate fetch, parse, and store | 2-3 |
+| Pipeline | Store raw responses before parsing so extraction can be replayed; skip writes for unchanged hashes; a Postgres job table suffices as the queue at small scale; one host handles a dozen sites ([1](https://www.reddit.com/comments/1nk33ec), [2](https://www.reddit.com/comments/1aosgks), [3](https://www.reddit.com/comments/1be1psf)) | 2-3 |
+| Politeness | Interleave work across hosts instead of bursting one; browsers leak memory, so restart them and block assets ([1](https://www.reddit.com/comments/1nk33ec)) | 2 |
+| Search providers | Date filters on Exa, Tavily, and Serper often return stale results ([1](https://www.reddit.com/comments/1v3uyop)); prices span about 25x; some terms forbid storing results ([HN](https://news.ycombinator.com/item?id=49963171)); Google Programmable Search is ending full-web search for new engines ([HN](https://news.ycombinator.com/item?id=46730436)) | 2-3 |
+| Research agents | Search, then fetch selected pages, then extract, beats embedding whole pages per query ([1](https://www.reddit.com/comments/1nqes66)); citations often fail to match the adjacent claim ([HN](https://news.ycombinator.com/item?id=49536375)) | 2-3 |
+| Company signals | Undated signals are noise; job postings repeat, duplicate across locations, or are speculative ([HN](https://news.ycombinator.com/item?id=42697783), [1](https://www.reddit.com/comments/1tlcb10)); LLMs invent contact details | many |
+| Legal posture | Public versus login-gated is the line commenters draw; reuse and republication carry more risk than fetching; personal data is the strict limit ([1](https://www.reddit.com/comments/1gc5lnf), [2](https://www.reddit.com/comments/1np791k)). Needs counsel and primary sources | 2-3 |
+| Crawler identity | Perplexity's undeclared fetching drew wide criticism; commenters dispute whether user-triggered fetches are crawling ([HN](https://news.ycombinator.com/item?id=44785636)) | many |
+
+Not covered by the collected threads: how Exa or Perplexity actually build their indexes,
+Rust crawler libraries in production, HTML main-text and date extraction quality, and proxy cost
+per gigabyte. Treat those as open questions, not as settled by absence.
+
 ## How to compare the candidates
 
 Use a small public or explicitly permitted company-research corpus, retaining source snapshots

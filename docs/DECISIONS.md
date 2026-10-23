@@ -1,5 +1,57 @@
 # Decisions
 
+## 2026-10-22 — first deliverable: durable Firecrawl replacement for AI tools
+
+The owner redirected the first deliverable to a durable Rust port of Firecrawl, with upgrades,
+for AI agents to call as a tool. `drip-training`'s research tools already call self-hosted
+Firecrawl (`/v1/scrape`, `/v1/search`) or context.dev (`/v1/web/scrape`, `/v1/web/search`), so
+DripSonar serves both wire shapes and replaces either backend without client changes.
+[ARCHITECTURE.md](ARCHITECTURE.md) is rewritten around that slice; crawl/map jobs, a browser tier,
+proxy routing, documents, and v2 routes follow. The Greenhouse signal slice moves after them.
+This supersedes "do not promise full API parity" for these four endpoints only.
+
+- robots.txt is not consulted for now, for testing (owner decision). Revisit before any shared or
+  production use.
+- Whether DripSonar ever presents as a normal browser stays open while the owner researches it.
+  Nothing implements impersonation; requests carry a declared user agent.
+- Firecrawl's size for scale: about 373k lines of code across the repository at the pinned
+  revision, about 165k in its non-test API server (22k of which is one model-price table), plus
+  about 115k lines of API tests (`wc -l`, including blanks and comments).
+
+## 2026-10-22 — architecture council
+
+The owner asked for a design council on the whole architecture. Three blind designers proposed
+from the same intake (repository docs, pinned references, `drip-kindness` at `ae4c7bf`, and the
+practitioner digest in [RESEARCH.md](RESEARCH.md)); a fresh judge scored them anonymized on a fixed
+rubric and selected one without blending. The root spot-checked the judge's central claims:
+Spider fetches its seed URL outside its own redirect SSRF guard (`spider/src/website.rs`), bundled
+`libsqlite3-sys` 0.37 enables FTS5, reqwest 0.12.28 exposes `no_proxy` and `dns_resolver`, and
+`drip-kindness`'s getter ignores robots `Disallow` by its owner's ruling.
+
+Selected: a single Rust package with a type-enforced egress seam (only `egress` can authorize a
+fetch), SQLite metadata plus content-addressed blob files, structured sources before HTML before a
+browser, escalation only by explicit per-host permission, honest declared identity by default, and
+Greenhouse job boards as the first source family. The next entry moved the first deliverable to a
+Firecrawl replacement; this design's foundations carry over into [ARCHITECTURE.md](ARCHITECTURE.md).
+
+- Graft from a losing proposal: proxied routes must tunnel to the locally validated address or fail
+  closed, because a residential exit sits on a third party's network.
+- Repairs before implementation: no `egress`↔`net` cycle; content-derived claim IDs so reruns are
+  idempotent; disable ambient proxies and check IP-literal hosts; blob-then-row write order; no
+  `egress`→`store` dependency in stage 1; stage-1 lifecycle limited to baseline and no inference
+  from failed captures. SQLite in stage 1 supersedes "inspectable artifact before a database";
+  JSON Lines export plus readable blob files keep evidence inspectable.
+- Rejected: files-and-manifest storage first (forces a stage-5 rewrite of repeat-fetch state);
+  an all-in-SQLite design that also banned impersonation outright and required numeric-address
+  proxies before the owner decided; Spider as the crawl core; Firecrawl-shaped services; orchestration
+  over hosted Firecrawl or Exa; a Python extraction sidecar from the start.
+- Owner decisions pending, with conservative defaults until decided: robots `Disallow` honored;
+  impersonation off; proxy off in stage 1; GitLab on Greenhouse as the first live target; crawler
+  identity and contact; raw-capture retention; license; language-model use and budget.
+
+Residual risk: Greenhouse field meanings may drift; Greenhouse robots.txt and terms are unchecked;
+the honest-identity default may lower coverage and must stay visible in reports.
+
 ## 2026-10-22 — reviewer bar and efficient delivery
 
 The owner explicitly requires a 97/100+ bar for every reviewer, short high-quality tests, minimal

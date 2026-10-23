@@ -26,6 +26,7 @@ Remote: `DreachAI/DripSonar` (private). Current scope and proof live in `docs/BU
 | When | Read |
 | --- | --- |
 | Scoping work or checking current capabilities | `docs/BUILDOUT.md` |
+| Designing or changing module boundaries, fetch, or egress | `docs/ARCHITECTURE.md` |
 | Writing or reviewing code | `docs/CODE_STYLE.md` |
 | Delegating, clarifying, or closing a subagent | `.agents/README.md` |
 | Changing a project decision | `docs/DECISIONS.md` |

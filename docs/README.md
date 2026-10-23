@@ -2,6 +2,7 @@
 
 | File | Owns |
 | --- | --- |
+| [ARCHITECTURE.md](ARCHITECTURE.md) | Selected design: modules, contracts, fetch and egress policy, stage-1 slice |
 | [BUILDOUT.md](BUILDOUT.md) | First use case, proposed delivery stages, and acceptance evidence |
 | [CODE_STYLE.md](CODE_STYLE.md) | Rules for future Rust implementation and tests |
 | [DECISIONS.md](DECISIONS.md) | Project decisions and provenance of adapted guidance |

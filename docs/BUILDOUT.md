@@ -69,8 +69,8 @@ historical agent procedures. Test the selected mechanism's actual behavior befor
 
 ## Decisions to settle when their stage starts
 
-- Stage 1: first company question and public source family; evidence schema; exact Rust dependencies;
-  code-reuse/license approach before translating upstream code.
+- Stage 1 is now the Firecrawl replacement in [ARCHITECTURE.md](ARCHITECTURE.md); the signal
+  stages below follow it. The owner still confirms crawler identity and license approach.
 - Stage 2: browser need and crawl scheduling model, based on measured source requirements.
 - Stage 4: local-corpus retrieval versus hosted discovery needs and data disclosure constraints.
 - Stage 5: storage, runtime platform, and service boundary, based on actual volume and consumers.

@@ -141,7 +141,7 @@ impl ScrapeError {
             Self::Invalid(_) => "BAD_REQUEST",
             Self::Blocked => "SCRAPE_ALL_ENGINES_FAILED",
             Self::Unsupported(_) => "SCRAPE_UNSUPPORTED_FILE_ERROR",
-            Self::Storage => "SCRAPE_STORAGE_ERROR",
+            Self::Storage | Self::Browser(BrowserError::Storage) => "SCRAPE_STORAGE_ERROR",
             Self::Pdf(DocumentError::Timeout) => "SCRAPE_TIMEOUT",
             Self::Pdf(DocumentError::NoTextLayer) => "SCRAPE_PDF_OCR_REQUIRED",
             Self::Pdf(DocumentError::Encrypted | DocumentError::Failed) => {
@@ -355,10 +355,9 @@ impl Scraper {
         } else {
             store::sha256_hex(format!("actions\n{}", uuid::Uuid::new_v4()).as_bytes())
         };
-        let id = self
-            .store
-            .put_rendered(&key, &output.capture)
+        let id = timeout_at(req.deadline, self.store.put_rendered(&key, &output.capture))
             .await
+            .map_err(|_| FetchError::Timeout)?
             .map_err(not_stored)?;
         let mut doc = render_stored(output.capture, id, req, false).await?;
         doc.browser = output.extras;
@@ -394,9 +393,9 @@ impl Scraper {
                     .render(&url, &headers, deadline, &BrowserPlan::default())
                     .await
                     .map_err(FlightError::Browser)?;
-                let id = store
-                    .put_rendered(&flight_key, &output.capture)
+                let id = timeout_at(deadline, store.put_rendered(&flight_key, &output.capture))
                     .await
+                    .map_err(|_| FlightError::Fetch(FetchError::Timeout))?
                     .map_err(not_stored)?;
                 Ok((output.capture, id))
             };

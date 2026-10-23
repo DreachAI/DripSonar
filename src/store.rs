@@ -118,6 +118,9 @@ pub struct Store {
     db: Arc<Db>,
     blobs: PathBuf,
     artifacts: PathBuf,
+    /// Serializes artifact publishing and sweeping, so a sweep never unlinks a blob that a
+    /// publish has written but not yet referenced, and the quota check holds until the insert.
+    artifact_lock: Arc<tokio::sync::Mutex<()>>,
 }
 
 pub struct Capture {
@@ -209,6 +212,7 @@ impl Store {
             }),
             blobs,
             artifacts,
+            artifact_lock: Arc::default(),
         })
     }
 
@@ -263,7 +267,9 @@ impl Store {
         quota: u64,
     ) -> Result<String, StoreError> {
         let store = self.clone();
+        let guard = Arc::clone(&self.artifact_lock).lock_owned().await;
         tokio::task::spawn_blocking(move || {
+            let _guard = guard;
             store.put_artifact_blocking(&body, media_type, ttl, quota)
         })
         .await
@@ -281,9 +287,13 @@ impl Store {
     /// Deletes expired artifact rows, then blob files no remaining row references.
     pub async fn sweep_artifacts(&self) -> Result<usize, StoreError> {
         let store = self.clone();
-        tokio::task::spawn_blocking(move || store.sweep_artifacts_blocking())
-            .await
-            .map_err(|_| StoreError::Task)?
+        let guard = Arc::clone(&self.artifact_lock).lock_owned().await;
+        tokio::task::spawn_blocking(move || {
+            let _guard = guard;
+            store.sweep_artifacts_blocking()
+        })
+        .await
+        .map_err(|_| StoreError::Task)?
     }
 
     fn cached_blocking(&self, key: &str, max_age: Duration) -> Result<Option<Capture>, StoreError> {
@@ -441,6 +451,7 @@ impl Store {
         blob_path(&self.blobs, hash)
     }
 
+    /// Runs under the artifact lock, so the quota check stays true until the insert.
     fn put_artifact_blocking(
         &self,
         body: &[u8],
@@ -448,20 +459,21 @@ impl Store {
         ttl: Duration,
         quota: u64,
     ) -> Result<String, StoreError> {
-        const USED: &str = "SELECT COALESCE(SUM(byte_len), 0) FROM artifacts";
         let len = i64::try_from(body.len()).map_err(|_| StoreError::Quota)?;
         let quota = i64::try_from(quota).unwrap_or(i64::MAX);
-        let fits = |used: i64| used.saturating_add(len) <= quota;
-        // Cheap refusal before writing the blob; the insert below re-checks atomically.
-        let used = {
+        let used: i64 = {
             let db = self.db.reader()?;
-            let used = db.query_row(USED, [], |row| row.get(0));
+            let used = db.query_row(
+                "SELECT COALESCE(SUM(byte_len), 0) FROM artifacts",
+                [],
+                |row| row.get(0),
+            );
             if used.is_ok() {
                 self.db.recycle(db);
             }
             used?
         };
-        if !fits(used) {
+        if used.saturating_add(len) > quota {
             return Err(StoreError::Quota);
         }
         let hash = sha256_hex(body);
@@ -473,21 +485,23 @@ impl Store {
         );
         let now = unix_ms(OffsetDateTime::now_utc())?;
         let ttl_ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
-        let mut db = self
+        let db = self
             .db
             .writer
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        let tx = db.transaction()?;
-        if !fits(tx.query_row(USED, [], |row| row.get(0))?) {
-            return Err(StoreError::Quota);
-        }
-        tx.execute(
+        let inserted = db.execute(
             "INSERT INTO artifacts (id, blob_sha256, media_type, byte_len, created_at_ms, expires_at_ms)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![id, hash, media_type, len, now, now.saturating_add(ttl_ms)],
-        )?;
-        tx.commit()?;
+        );
+        if let Err(error) = inserted {
+            // When the check itself fails, keep the blob: an orphan is harmless.
+            if matches!(artifact_referenced(&db, &hash), Ok(false)) {
+                let _ = fs::remove_file(blob_path(&self.artifacts, &hash));
+            }
+            return Err(error.into());
+        }
         Ok(id)
     }
 
@@ -532,19 +546,16 @@ impl Store {
                 .collect::<Result<_, _>>()?;
             hashes.sort();
             hashes.dedup();
-            let mut referenced =
-                tx.prepare("SELECT EXISTS(SELECT 1 FROM artifacts WHERE blob_sha256 = ?1)")?;
             let mut unreferenced = Vec::new();
             for hash in hashes {
-                if !referenced.query_row(params![hash], |row| row.get::<_, bool>(0))? {
+                if !artifact_referenced(&tx, &hash)? {
                     unreferenced.push(hash);
                 }
             }
-            drop(referenced);
             tx.commit()?;
             unreferenced
         };
-        // A new row for the same bytes may race this delete; serving then reports it missing.
+        // The artifact lock keeps a publish from referencing these bytes again meanwhile.
         for hash in &unreferenced {
             match fs::remove_file(blob_path(&self.artifacts, hash)) {
                 Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
@@ -553,6 +564,14 @@ impl Store {
         }
         Ok(unreferenced.len())
     }
+}
+
+fn artifact_referenced(conn: &Connection, hash: &str) -> Result<bool, StoreError> {
+    Ok(conn.query_row(
+        "SELECT EXISTS(SELECT 1 FROM artifacts WHERE blob_sha256 = ?1)",
+        params![hash],
+        |row| row.get(0),
+    )?)
 }
 
 /// Rows written before the `tier` column existed are HTTP captures.

@@ -12,6 +12,7 @@ mod sessions;
 mod types;
 
 use std::{
+    future::Future,
     sync::{Arc, Weak},
     time::Duration,
 };
@@ -62,6 +63,8 @@ pub enum BrowserError {
     },
     #[error("{0}")]
     Limit(&'static str),
+    #[error("screenshot could not be stored")]
+    Storage,
     #[error("browser session not found or expired")]
     SessionNotFound,
     #[error("all browser sessions are in use")]
@@ -183,15 +186,18 @@ impl BrowserTier {
         plan: &BrowserPlan,
     ) -> Result<BrowserOutput, BrowserError> {
         let tier = self.tier()?;
-        let _admission = tier.fetcher.admit(url, deadline).await?;
-        let policy = TabPolicy {
-            origin: url.origin(),
-            headers: headers.to_vec(),
-            block_assets: !plan.is_visual(),
-        };
-        let tab = tier.pool.lease(policy, deadline, true).await?;
-        actions::navigate(&tab.page, url, deadline).await?;
-        tier.visit(&tab, url, plan, deadline).await
+        within(deadline, async {
+            let _admission = tier.fetcher.admit(url, deadline).await?;
+            let policy = TabPolicy {
+                origin: url.origin(),
+                headers: headers.to_vec(),
+                block_assets: !plan.is_visual(),
+            };
+            let tab = tier.pool.lease(policy, deadline, true).await?;
+            actions::navigate(&tab.page, url, deadline).await?;
+            tier.visit(&tab, url, plan, deadline).await
+        })
+        .await
     }
 
     /// Cache key for a rendered capture: URL, headers, and everything that changes rendering.
@@ -247,20 +253,24 @@ impl BrowserTier {
     ) -> Result<(String, BrowserOutput), BrowserError> {
         let tier = self.tier()?;
         let permit = tier.sessions.reserve()?;
-        let _admission = tier.fetcher.admit(url, deadline).await?;
-        let policy = TabPolicy {
-            origin: url.origin(),
-            headers: Vec::new(),
-            block_assets: false,
-        };
-        let tab = tier.pool.lease(policy, deadline, false).await?;
-        actions::navigate(&tab.page, url, deadline).await?;
-        let output = tier.visit(&tab, url, plan, deadline).await?;
-        Ok((tier.sessions.insert(permit, tab), output))
+        within(deadline, async {
+            let _admission = tier.fetcher.admit(url, deadline).await?;
+            let policy = TabPolicy {
+                origin: url.origin(),
+                headers: Vec::new(),
+                block_assets: false,
+            };
+            let tab = tier.pool.lease(policy, deadline, false).await?;
+            actions::navigate(&tab.page, url, deadline).await?;
+            let output = tier.visit(&tab, url, plan, deadline).await?;
+            Ok((tier.sessions.insert(permit, tab), output))
+        })
+        .await
     }
 
     /// Runs one step in a session. Steps of one session run one at a time; host admission is
-    /// taken for the page's current URL for the length of the step.
+    /// taken for the page's current URL for the length of the step. A step that runs out of
+    /// time leaves the page mid-action, so it ends the session.
     pub async fn session_step(
         &self,
         id: &str,
@@ -268,19 +278,19 @@ impl BrowserTier {
         deadline: Instant,
     ) -> Result<BrowserOutput, BrowserError> {
         let tier = self.tier()?;
-        let session = tier.sessions.get(id)?;
-        let tab = timeout_at(deadline, session.tab.lock())
-            .await
-            .map_err(|_| FetchError::Timeout)?;
-        if tab.is_dead() {
+        let (tab, _session) = tier.sessions.acquire(id, deadline).await?;
+        let output = within(deadline, async {
+            let current = actions::location(&tab.page, deadline)
+                .await
+                .ok_or(BrowserError::Unavailable("session page unreadable"))?;
+            let _admission = tier.fetcher.admit(&current, deadline).await?;
+            tier.visit(&tab, &current, plan, deadline).await
+        })
+        .await;
+        if matches!(output, Err(BrowserError::Fetch(FetchError::Timeout))) {
             tier.sessions.remove(id);
-            return Err(BrowserError::SessionNotFound);
         }
-        let current = actions::location(&tab.page, deadline)
-            .await
-            .ok_or(BrowserError::Unavailable("session page unreadable"))?;
-        let _admission = tier.fetcher.admit(&current, deadline).await?;
-        tier.visit(&tab, &current, plan, deadline).await
+        output
     }
 
     pub fn close_session(&self, id: &str) -> Result<(), BrowserError> {
@@ -323,10 +333,12 @@ impl Tier {
         if snapshot.html.len() > self.max_bytes {
             return Err(FetchError::TooLarge.into());
         }
-        if snapshot.status == 0 {
-            // Never invent a status: an unknown one is a failed visit.
-            return Err(BrowserError::Unavailable("navigation status unknown"));
-        }
+        // Never invent a status: an unknown one is a failed visit.
+        let (status, headers) = tab
+            .net
+            .response()
+            .filter(|(status, _)| *status != 0)
+            .ok_or(BrowserError::Unavailable("navigation status unknown"))?;
         let final_url = Url::parse(&snapshot.url).unwrap_or_else(|_| requested.clone());
         let screenshot = match screenshot {
             Some((bytes, media_type)) => Some(self.publish(bytes, media_type).await?),
@@ -352,8 +364,8 @@ impl Tier {
                 .route_for(final_url.host_str().unwrap_or_default()),
             requested_url: requested.clone(),
             final_url,
-            status: snapshot.status,
-            headers: Vec::new(),
+            status,
+            headers,
             content_type: Some("text/html; charset=utf-8".into()),
             body: snapshot.html.into(),
             fetched_at: OffsetDateTime::now_utc(),
@@ -381,7 +393,7 @@ impl Tier {
                 StoreError::Quota => BrowserError::Limit("screenshot storage quota exhausted"),
                 error => {
                     tracing::error!(%error, "screenshot not stored");
-                    BrowserError::Unavailable("screenshot storage failed")
+                    BrowserError::Storage
                 }
             })?;
         self.artifact_base
@@ -389,6 +401,16 @@ impl Tier {
             .map(String::from)
             .map_err(|_| BrowserError::Unavailable("invalid artifact URL"))
     }
+}
+
+/// Bounds a whole browser workflow, storage included; dropping it on expiry releases its tab.
+async fn within<T>(
+    deadline: Instant,
+    work: impl Future<Output = Result<T, BrowserError>>,
+) -> Result<T, BrowserError> {
+    timeout_at(deadline, work)
+        .await
+        .map_err(|_| FetchError::Timeout)?
 }
 
 fn spawn_reaper(tier: Weak<Tier>) -> JoinHandle<()> {

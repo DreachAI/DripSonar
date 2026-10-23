@@ -179,16 +179,23 @@ impl Tab {
 
 struct Lease {
     instance: Arc<Instance>,
+    /// A context was requested but Chrome's reply never arrived: one may exist unknown to us.
+    context_pending: bool,
     context: Option<BrowserContextId>,
     target: Option<String>,
+    events: Option<JoinHandle<()>>,
     slot: Option<OwnedSemaphorePermit>,
     one_shot: bool,
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        let (instance, context, target, slot, one_shot) = (
+        if let Some(events) = self.events.take() {
+            events.abort();
+        }
+        let (instance, context_pending, context, target, slot, one_shot) = (
             Arc::clone(&self.instance),
+            self.context_pending,
             self.context.take(),
             self.target.take(),
             self.slot.take(),
@@ -198,6 +205,10 @@ impl Drop for Lease {
             return;
         };
         runtime.spawn(async move {
+            if context_pending {
+                // Only disconnecting disposes a context we cannot name (dispose on detach).
+                instance.fail("browser context creation abandoned");
+            }
             if let Some(target) = target {
                 instance.net.unregister(&target);
             }
@@ -262,20 +273,25 @@ impl Pool {
         }
         let mut lease = Lease {
             instance: Arc::clone(&instance),
+            context_pending: true,
             context: None,
             target: None,
+            events: None,
             slot: Some(slot),
             one_shot,
         };
         let browser = &instance.browser;
-        let context = command(deadline, async {
+        // The outer error is a timeout; dropping this future mid-reply leaves the lease pending.
+        let created = command(deadline, async {
             let params = CreateBrowserContextParams {
                 dispose_on_detach: Some(true),
                 ..CreateBrowserContextParams::default()
             };
-            browser.read().await.create_browser_context(params).await
+            Ok(browser.read().await.create_browser_context(params).await)
         })
         .await?;
+        lease.context_pending = false;
+        let context = created.map_err(|_| BrowserError::Unavailable("browser command failed"))?;
         lease.context = Some(context.clone());
         let page = command(deadline, async {
             let browser = browser.read().await;
@@ -298,6 +314,7 @@ impl Pool {
         let target: &str = page.target_id().as_ref();
         lease.target = Some(target.to_owned());
         let net = instance.net.register(target, policy);
+        lease.events = Some(command(deadline, net.listen(&page)).await?);
         Ok(Tab { page, net, lease })
     }
 
@@ -451,7 +468,17 @@ impl Pool {
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(tokio::spawn(watch));
         }
-        let started = timeout_at(deadline, instance.net.start(Arc::clone(&instance.browser))).await;
+        let failing = Arc::downgrade(&instance);
+        let on_lost = Arc::new(move || {
+            if let Some(instance) = failing.upgrade() {
+                instance.fail("browser left a request paused");
+            }
+        });
+        let started = timeout_at(
+            deadline,
+            instance.net.start(Arc::clone(&instance.browser), on_lost),
+        )
+        .await;
         match started {
             Ok(Ok(task)) => {
                 instance

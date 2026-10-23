@@ -1,39 +1,59 @@
 //! Browser-wide request interception: proxy authentication, per-tab request policy, and
-//! popup refusal.
+//! popup refusal; plus each tab's main-frame commits and document responses.
 //!
 //! `Fetch` is enabled on the browser session rather than per page, so its events reach only
 //! this module: chromiumoxide's per-page network manager would otherwise answer every auth
 //! challenge itself and could hand the proxy token to a site. Every paused request gets
-//! exactly one continue or fail.
+//! exactly one continue or fail; a request Chrome cannot be made to release fails the instance.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::{
         Arc, Mutex, PoisonError,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
     },
+    time::Duration,
 };
 
 use chromiumoxide::{
-    Browser,
+    Browser, Command, Page,
     cdp::browser_protocol::{
         fetch::{
             AuthChallengeResponse, AuthChallengeResponseResponse, AuthChallengeSource,
             ContinueRequestParams, ContinueWithAuthParams, EnableParams, EventAuthRequired,
             EventRequestPaused, FailRequestParams, HeaderEntry, RequestPattern,
         },
-        network::{ErrorReason, ResourceType},
+        network::{ErrorReason, EventResponseReceived, ResourceType},
+        page::EventFrameNavigated,
         target::{CloseTargetParams, EventTargetCreated},
     },
+    error::CdpError,
 };
 use futures::StreamExt;
-use tokio::{sync::RwLock, task::JoinHandle};
+use tokio::{sync::RwLock, task::JoinHandle, time::timeout};
 use url::{Origin, Url};
 
 /// Redirects followed per top-level navigation, as for plain fetches.
 const MAX_REDIRECTS: usize = 5;
 /// Remembered proxy-auth attempts; a second challenge for the same request is cancelled.
 const MAX_AUTH_ATTEMPTS: usize = 1024;
+/// How long Chrome gets to accept one interception reply.
+const REPLY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Main-frame document responses remembered per tab; older ones can no longer commit.
+const MAX_RESPONSES: usize = 8;
+/// Caller headers Chrome manages itself or that would address our proxy; never forwarded.
+const UNSENDABLE: [&str; 10] = [
+    "host",
+    "content-length",
+    "connection",
+    "keep-alive",
+    "proxy-connection",
+    "proxy-authorization",
+    "te",
+    "trailer",
+    "transfer-encoding",
+    "upgrade",
+];
 
 /// Request policy for one tab's main frame.
 pub(super) struct TabPolicy {
@@ -46,8 +66,6 @@ pub(super) struct TabPolicy {
 
 pub(super) struct TabNet {
     policy: TabPolicy,
-    /// Top-level document requests seen, so actions can tell when they started a navigation.
-    navigations: AtomicU64,
     document: Mutex<Document>,
 }
 
@@ -55,16 +73,105 @@ pub(super) struct TabNet {
 struct Document {
     url: Option<Url>,
     redirects: usize,
+    /// Top-level document requests seen, including redirect hops.
+    requests: u64,
+    /// Loader ID of the newest main-frame commit.
+    committed: Option<String>,
+    /// Recent main-frame document responses, newest last.
+    responses: VecDeque<Response>,
+}
+
+struct Response {
+    loader: String,
+    status: u16,
+    headers: Vec<(String, String)>,
+}
+
+/// Where the tab's navigation stands; any change means a navigation started.
+#[derive(Clone, PartialEq)]
+pub(super) struct Mark {
+    requests: u64,
+    pub committed: Option<String>,
 }
 
 impl TabNet {
-    pub(super) fn navigations(&self) -> u64 {
-        self.navigations.load(Ordering::Acquire)
+    pub(super) fn mark(&self) -> Mark {
+        let document = self.lock();
+        Mark {
+            requests: document.requests,
+            committed: document.committed.clone(),
+        }
     }
 
-    /// The newest top-level document URL requested, including redirect hops.
-    pub(super) fn document_url(&self) -> Option<Url> {
-        self.lock().url.clone()
+    /// Status and headers of the committed main-frame document, when Chrome reported them.
+    pub(super) fn response(&self) -> Option<(u16, Vec<(String, String)>)> {
+        let document = self.lock();
+        let committed = document.committed.as_deref()?;
+        let response = document
+            .responses
+            .iter()
+            .rev()
+            .find(|response| response.loader == committed)?;
+        Some((response.status, response.headers.clone()))
+    }
+
+    /// Records main-frame document responses and commits from the page's own events until the
+    /// page goes away. Subscribed before any navigation, so none is missed.
+    pub(super) async fn listen(
+        self: &Arc<Self>,
+        page: &Page,
+    ) -> chromiumoxide::Result<JoinHandle<()>> {
+        let frame = page.target_id().as_ref().to_owned();
+        let mut responses = page.event_listener::<EventResponseReceived>().await?;
+        let mut commits = page.event_listener::<EventFrameNavigated>().await?;
+        let this = Arc::clone(self);
+        Ok(tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    Some(event) = responses.next() => {
+                        if event.r#type == ResourceType::Document
+                            && event.frame_id.as_ref().is_some_and(|id| id.as_ref() == frame)
+                        {
+                            this.on_response(&event);
+                        }
+                    }
+                    Some(event) = commits.next() => {
+                        if event.frame.parent_id.is_none() && event.frame.id.as_ref() == frame {
+                            this.lock().committed = Some(event.frame.loader_id.as_ref().to_owned());
+                        }
+                    }
+                    else => break,
+                }
+            }
+        }))
+    }
+
+    fn on_response(&self, event: &EventResponseReceived) {
+        // Chrome joins repeated headers with newlines.
+        let headers = event
+            .response
+            .headers
+            .inner()
+            .as_object()
+            .into_iter()
+            .flatten()
+            .filter_map(|(name, value)| Some((name.to_ascii_lowercase(), value.as_str()?)))
+            .flat_map(|(name, value)| {
+                value
+                    .split('\n')
+                    .map(move |value| (name.clone(), value.to_owned()))
+            })
+            .collect();
+        let mut document = self.lock();
+        if document.responses.len() >= MAX_RESPONSES {
+            document.responses.pop_front();
+        }
+        document.responses.push_back(Response {
+            loader: event.loader_id.as_ref().to_owned(),
+            // An out-of-range status stays unknown (0), which fails the visit.
+            status: u16::try_from(event.response.status).unwrap_or(0),
+            headers,
+        });
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, Document> {
@@ -87,7 +194,7 @@ impl TabNet {
             document.redirects = 0;
         }
         document.url = Some(url.clone());
-        self.navigations.fetch_add(1, Ordering::AcqRel);
+        document.requests += 1;
         true
     }
 }
@@ -120,10 +227,11 @@ impl Interceptor {
     }
 
     /// Subscribes before enabling interception, so no event is missed, then answers events
-    /// until the browser connection ends.
+    /// until the browser connection ends. `on_lost` runs when a paused request may stay stuck.
     pub(super) async fn start(
         self: &Arc<Self>,
         browser: Arc<RwLock<Browser>>,
+        on_lost: Arc<dyn Fn() + Send + Sync>,
     ) -> chromiumoxide::Result<JoinHandle<()>> {
         let (mut paused, mut auth, mut created) = {
             let handle = browser.read().await;
@@ -156,28 +264,46 @@ impl Interceptor {
                     },
                     else => break,
                 };
-                let browser = Arc::clone(&browser);
-                // A failed reply means the target or connection is gone; nothing waits on it.
+                let (browser, on_lost) = (Arc::clone(&browser), Arc::clone(&on_lost));
                 tokio::spawn(async move {
-                    let browser = browser.read().await;
-                    let _ = match reply {
-                        Reply::Continue(params) => browser.execute(params).await.map(drop),
-                        Reply::Fail(params) => browser.execute(params).await.map(drop),
-                        Reply::Auth(params) => browser.execute(params).await.map(drop),
-                        Reply::Close(params) => browser.execute(params).await.map(drop),
+                    let outcome = match reply {
+                        Reply::Continue(params) => {
+                            let id = params.request_id.clone();
+                            match send(&browser, params).await {
+                                Outcome::Done => Outcome::Done,
+                                // Refused (say, a header Chrome will not send) or unanswered:
+                                // fail it instead, so the page never waits on it.
+                                _ => {
+                                    let fail = FailRequestParams::new(id, ErrorReason::Failed);
+                                    send(&browser, fail).await
+                                }
+                            }
+                        }
+                        Reply::Fail(params) => send(&browser, params).await,
+                        Reply::Auth(params) => send(&browser, params).await,
+                        // A popup may close itself first; one left open has no caller headers.
+                        Reply::Close(params) => {
+                            let _ = send(&browser, params).await;
+                            Outcome::Done
+                        }
                     };
+                    if outcome == Outcome::Lost {
+                        on_lost();
+                    }
                 });
             }
         }))
     }
 
-    pub(super) fn register(&self, target_id: &str, policy: TabPolicy) -> Arc<TabNet> {
+    pub(super) fn register(&self, target_id: &str, mut policy: TabPolicy) -> Arc<TabNet> {
         if !policy.block_assets {
             self.visual_tabs.fetch_add(1, Ordering::AcqRel);
         }
+        policy
+            .headers
+            .retain(|(name, _)| !UNSENDABLE.iter().any(|h| name.eq_ignore_ascii_case(h)));
         let net = Arc::new(TabNet {
             policy,
-            navigations: AtomicU64::new(0),
             document: Mutex::default(),
         });
         self.lock_tabs()
@@ -269,6 +395,27 @@ impl Interceptor {
             event.request_id.clone(),
             response,
         ))
+    }
+}
+
+#[derive(PartialEq)]
+enum Outcome {
+    Done,
+    /// Chrome answered with an error: the request is gone or the reply was invalid.
+    Refused,
+    /// No answer in time, or the connection failed.
+    Lost,
+}
+
+async fn send<C: Command>(browser: &RwLock<Browser>, params: C) -> Outcome {
+    let sent = timeout(REPLY_TIMEOUT, async {
+        browser.read().await.execute(params).await
+    })
+    .await;
+    match sent {
+        Ok(Ok(_)) => Outcome::Done,
+        Ok(Err(CdpError::Chrome(_))) => Outcome::Refused,
+        _ => Outcome::Lost,
     }
 }
 

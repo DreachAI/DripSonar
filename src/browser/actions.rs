@@ -22,7 +22,7 @@ use url::Url;
 
 use super::{
     BrowserError,
-    network::TabNet,
+    network::{Mark, TabNet},
     pool::command,
     types::{Action, Direction, JsReturn, PageScrape, Shot, parse_key},
 };
@@ -46,13 +46,13 @@ const MAX_ACTION_CONTENT_BYTES: usize = 16 << 20;
 const VISIBLE: &str = "(s,i)=>{const v=[...document.querySelectorAll(s)].filter(e=>{const r=e.getBoundingClientRect(),c=getComputedStyle(e);return r.width>0&&r.height>0&&c.visibility!=='hidden'&&c.display!=='none'});if(i<0)return v.length;const e=v[i];if(!e)return null;e.scrollIntoView({block:'center',inline:'center'});const r=e.getBoundingClientRect();return{x:r.left+r.width/2,y:r.top+r.height/2}}";
 /// `(selector, up)`: scrolls the page, or the selected container, by one of its heights.
 const SCROLL: &str = "(s,up)=>{const t=s?document.querySelector(s):null;if(s&&!t)throw new Error('no element matches the selector');const h=t?t.clientHeight:innerHeight;(t||window).scrollBy(0,up?-h:h)}";
-/// The committed document: URL, real navigation status (0 when unknown), and DOM.
-const SNAPSHOT: &str = "(()=>{const n=performance.getEntriesByType('navigation')[0];return{url:location.href,status:n?n.responseStatus:0,html:document.documentElement?document.documentElement.outerHTML:''}})()";
+/// The current document's URL and DOM; its status comes from Chrome's response events.
+const SNAPSHOT: &str =
+    "({url:location.href,html:document.documentElement?document.documentElement.outerHTML:''})";
 
 #[derive(Deserialize)]
 pub(super) struct Snapshot {
     pub url: String,
-    pub status: u16,
     pub html: String,
 }
 
@@ -188,7 +188,7 @@ async fn step(
     deadline: Instant,
     captured: &mut Captured,
 ) -> Result<(), StepError> {
-    let navigations = net.navigations();
+    let before = net.mark();
     match action {
         Action::Wait {
             milliseconds: Some(ms),
@@ -232,7 +232,7 @@ async fn step(
                     "no visible element matches the selector".into(),
                 ));
             }
-            settle(page, net, navigations, deadline).await?;
+            settle(page, net, &before, deadline).await?;
         }
         Action::Screenshot { full_page, quality } => {
             let shot = Shot {
@@ -246,7 +246,7 @@ async fn step(
         }
         Action::Press { key } => {
             press(page, key, deadline).await?;
-            settle(page, net, navigations, deadline).await?;
+            settle(page, net, &before, deadline).await?;
         }
         Action::Scroll {
             direction,
@@ -277,7 +277,7 @@ async fn step(
                 kind: result.r#type.as_ref().to_owned(),
                 value,
             });
-            settle(page, net, navigations, deadline).await?;
+            settle(page, net, &before, deadline).await?;
         }
     }
     Ok(())
@@ -350,29 +350,27 @@ pub(super) async fn location(page: &Page, deadline: Instant) -> Option<Url> {
     Url::parse(object.value?.as_str()?).ok()
 }
 
-/// After an action that may navigate: if it started a top-level navigation, wait for the new
-/// document to commit (bounded, since a 204 or download never commits) and become ready.
+/// After an action that may navigate: if it started a top-level navigation, wait for a new
+/// main-frame document to commit, then to become ready. One that never commits (a 204, a
+/// refused download) fails the action.
 async fn settle(
     page: &Page,
     net: &TabNet,
-    before: u64,
+    before: &Mark,
     deadline: Instant,
 ) -> Result<(), StepError> {
     sleep_until(deadline.min(Instant::now() + NAVIGATION_START)).await;
-    if net.navigations() == before {
+    if net.mark() == *before {
         return Ok(());
     }
     let give_up = deadline.min(Instant::now() + NAVIGATION_COMMIT);
-    while Instant::now() < give_up {
-        let committed = match (net.document_url(), location(page, deadline).await) {
-            (Some(target), Some(mut current)) => {
-                current.set_fragment(None);
-                current == target
-            }
-            _ => false,
-        };
-        if committed {
-            break;
+    while net.mark().committed == before.committed {
+        if Instant::now() >= give_up {
+            return Err(if give_up == deadline {
+                BrowserError::from(FetchError::Timeout).into()
+            } else {
+                StepError::Page("the navigation it started did not commit".into())
+            });
         }
         sleep_until(give_up.min(Instant::now() + POLL)).await;
     }

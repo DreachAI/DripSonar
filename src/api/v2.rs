@@ -12,6 +12,7 @@ pub(super) fn routes() -> Router<AppState> {
         .route("/v2/search", post(search))
         .route("/v2/map", post(map))
         .route("/v2/crawl", post(crawl_start))
+        .route("/v2/crawl/active", get(jobs::crawl_active))
         .route(
             "/v2/crawl/{id}",
             get(crawl_status).delete(jobs::crawl_cancel),
@@ -74,7 +75,7 @@ fn no_fields(object: &Map<String, Value>, field: &str) -> Result<(), ApiError> {
 fn scrape_options(
     body: &mut Map<String, Value>,
 ) -> Result<(ScrapeOptions, Option<Shot>), ApiError> {
-    reject(body, &["parsePDF", "jsonOptions"])?;
+    reject(body, &["parsePDF", "jsonOptions", "changeTrackingOptions"])?;
     let mut shot = None;
     if let Some(formats) = take::<Vec<Value>>(body, "formats")? {
         let mut translated = Vec::new();
@@ -106,6 +107,14 @@ fn scrape_options(
                     name
                 }
                 "summary" => name,
+                "changeTracking" => {
+                    let modes: Option<Vec<String>> = take(&mut options, "modes")?;
+                    body.insert(
+                        "changeTrackingOptions".into(),
+                        json!({"modes": modes.unwrap_or_default()}),
+                    );
+                    name
+                }
                 "screenshot" => {
                     if shot.is_some() {
                         return Err(ApiError::bad_request(
@@ -174,7 +183,7 @@ async fn scrape_document(
     plan.screenshot = shot;
     let doc = state.scraper.scrape_with(&request, &plan).await?;
     state
-        .extracted_document(&doc, &formats, &request.url, opts)
+        .extracted_document(&doc, &formats, &request.url, opts, request.deadline)
         .await
 }
 
@@ -266,6 +275,7 @@ async fn batch_start(
         "ignoreInvalidURLs",
         "maxConcurrency",
         "deduplicateSimilarURLs",
+        "webhook",
     ] {
         if let Some(value) = body.remove(field) {
             job.insert(field.into(), value);
@@ -347,20 +357,25 @@ fn matches_domain(host: &str, domains: &[String]) -> bool {
 
 async fn search(State(state): State<AppState>, body: Result<Bytes, BytesRejection>) -> Reply {
     let mut body: Map<String, Value> = parse(body)?;
-    reject(&body, &["tbs", "location", "filter"])?;
+    reject(&body, &["location", "filter"])?;
+    let mut news = false;
     if let Some(sources) = take::<Vec<Value>>(&mut body, "sources")? {
         if sources.is_empty() {
-            return Err(ApiError::bad_request("sources must contain web"));
+            return Err(ApiError::bad_request("sources must contain web or news"));
         }
+        let mut translated = Vec::new();
         for source in sources {
             let (name, options) = variant(source, "sources")?;
-            if name != "web" {
+            if !matches!(name.as_str(), "web" | "news") {
                 return Err(ApiError::bad_request(format!(
                     "sources.{name} is not supported"
                 )));
             }
-            no_fields(&options, "sources.web")?;
+            no_fields(&options, &format!("sources.{name}"))?;
+            news |= name == "news";
+            translated.push(name);
         }
+        body.insert("sources".into(), json!(translated));
     }
     let include = domains(&mut body, "includeDomains")?;
     let exclude = domains(&mut body, "excludeDomains")?;
@@ -428,8 +443,9 @@ async fn search(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
         .buffered(SEARCH_SCRAPE_CONCURRENCY)
         .collect()
         .await;
-    let mut result = json!({"success": true, "data": {"web": data}});
-    if result["data"]["web"].as_array().is_some_and(Vec::is_empty) {
+    let source = if news { "news" } else { "web" };
+    let mut result = json!({"success": true, "data": {source: data}});
+    if result["data"][source].as_array().is_some_and(Vec::is_empty) {
         result["warning"] = json!("No search results found");
     }
     Ok(Json(result))

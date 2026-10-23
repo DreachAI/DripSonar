@@ -1,5 +1,8 @@
 //! One scrape: cache, single-flight, fetch, classify, render.
 
+mod change;
+pub use change::ChangeTrackingOptions;
+
 use std::{
     collections::HashMap,
     sync::{Arc, Mutex, OnceLock, PoisonError},
@@ -79,6 +82,8 @@ pub struct Document {
     pub raw_html: Option<String>,
     /// Firecrawl's `warning`: why a successful document carries less than requested.
     pub warning: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change_tracking: Option<serde_json::Value>,
     /// Screenshot URL and action results from an explicit browser visit; never persisted,
     /// since jobs do not run browser plans.
     #[serde(skip)]
@@ -810,6 +815,7 @@ fn parse_capture(
                 rendered: Rendered::default(),
                 raw_html: None,
                 warning: None,
+                change_tracking: None,
                 browser: BrowserExtras::default(),
             },
             fetched.body,
@@ -854,6 +860,7 @@ fn parse_capture(
             rendered,
             raw_html: req.raw_html.then_some(text),
             warning: None,
+            change_tracking: None,
             browser: BrowserExtras::default(),
         },
         escalation,

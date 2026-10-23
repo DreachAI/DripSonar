@@ -32,6 +32,7 @@ pub(crate) mod testkit {
             bind: addr,
             data_dir: std::env::temp_dir(),
             api_key: None,
+            webhook_secret: None,
             llm: crate::extract::LlmConfig::default(),
             user_agent: "DripSonar-test".into(),
             searxng_endpoint: None,

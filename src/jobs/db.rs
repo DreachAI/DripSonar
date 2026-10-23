@@ -23,6 +23,12 @@ CREATE INDEX IF NOT EXISTS frontier_dup ON frontier(job_id, content_sha);
 CREATE INDEX IF NOT EXISTS frontier_open ON frontier(job_id) WHERE state IN ('queued','leased');
 CREATE TABLE IF NOT EXISTS documents (
  frontier_id INTEGER PRIMARY KEY REFERENCES frontier(id) ON DELETE CASCADE, doc TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS webhooks (
+ id INTEGER PRIMARY KEY, job_id TEXT NOT NULL REFERENCES jobs(id) ON DELETE CASCADE,
+ event TEXT NOT NULL, payload TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
+ next_at INTEGER NOT NULL, delivered INTEGER NOT NULL DEFAULT 0);
+CREATE INDEX IF NOT EXISTS webhooks_due ON webhooks(next_at,id) WHERE delivered=0 AND attempts<3;
+CREATE INDEX IF NOT EXISTS webhooks_job ON webhooks(job_id);
 ";
 /// Needs `not_before_ms`, which older stores gain by ALTER first. Covering for host refill and
 /// lease: both walk hosts or IDs in order and skip rows still backing off.
@@ -66,7 +72,8 @@ pub async fn initialize(store: &Store, retention: u64) -> Result<(), StoreError>
             tx.execute_batch(QUEUED_INDEX)?;
             let now = now_ms();
             tx.execute(
-                "DELETE FROM jobs WHERE expires_ms <= ?1 AND status!='scraping'",
+                "DELETE FROM jobs WHERE expires_ms <= ?1 AND status!='scraping'
+                 AND NOT EXISTS(SELECT 1 FROM webhooks WHERE job_id=jobs.id AND delivered=0 AND attempts<3)",
                 [now],
             )?;
             tx.execute(
@@ -90,6 +97,9 @@ pub async fn initialize(store: &Store, retention: u64) -> Result<(), StoreError>
             for id in ids {
                 finish(tx, &id, retention)?;
             }
+            let terminal = tx.prepare("SELECT id FROM jobs WHERE status!='scraping'")?
+                .query_map([], |row| row.get::<_, String>(0))?.collect::<Result<Vec<_>, _>>()?;
+            for id in terminal { scrub_webhook(tx, &id)?; }
             Ok(())
         })
         .await
@@ -107,6 +117,138 @@ pub async fn active(store: &Store) -> Result<Vec<(String, u64)>, StoreError> {
                     Ok((row.get(0)?, u64::from(row.get::<_, u32>(1)?)))
                 })?
                 .collect::<Result<Vec<_>, _>>()?)
+        })
+        .await
+}
+
+pub async fn active_crawls(store: &Store) -> Result<Vec<serde_json::Value>, StoreError> {
+    store.read(|conn| {
+        let mut stmt = conn.prepare(
+            "SELECT j.id,f.url,j.spec,j.request FROM jobs j JOIN frontier f ON f.id=(
+             SELECT MIN(id) FROM frontier WHERE job_id=j.id AND task='page')
+             WHERE j.kind='crawl' AND j.status='scraping' ORDER BY j.created_ms,j.id")?;
+        let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?, row.get::<_, String>(3)?)))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows.into_iter().map(|(id, url, spec, request)| {
+            let spec: JobSpec = decode(&spec)?;
+            let request: serde_json::Value = decode(&request)?;
+            let scope = spec.scope.ok_or(StoreError::Corrupt)?;
+            let options = scope.options();
+            // Deliberately enumerate public fields: neither page nor webhook credentials escape.
+            Ok(serde_json::json!({"id": id, "url": url, "options": {
+                "limit": spec.limit, "maxDepth": options.max_depth,
+                "maxDiscoveryDepth": options.max_discovery_hops,
+                "includePaths": options.include_paths, "excludePaths": options.exclude_paths,
+                "allowBackwardLinks": options.allow_backward_links,
+                "crawlEntireDomain": options.crawl_entire_domain,
+                "allowExternalLinks": options.allow_external_links, "allowSubdomains": options.allow_subdomains,
+                "ignoreQueryParameters": options.ignore_query_parameters,
+                "delay": spec.delay_ms.map(|ms| ms as f64 / 1000.0),
+                "scrapeOptions": {"formats": request["formats"], "timeout": spec.scrape.timeout_ms,
+                    "maxAge": spec.scrape.max_age_ms, "onlyMainContent": spec.scrape.render.only_main_content,
+                    "includeTags": spec.scrape.render.include_tags, "excludeTags": spec.scrape.render.exclude_tags}
+            }}))
+        }).collect()
+    }).await
+}
+
+/// The event and the state transition that caused it always commit together.
+fn enqueue_webhook(
+    tx: &Transaction<'_>,
+    id: &str,
+    event: &str,
+    success: bool,
+    data: serde_json::Value,
+    error: Option<&str>,
+) -> Result<(), StoreError> {
+    let (webhook, kind): (Option<String>, String) = tx.query_row(
+        "SELECT json_extract(spec,'$.webhook'),kind FROM jobs WHERE id=?1",
+        [id],
+        |row| Ok((row.get(0)?, row.get(1)?)),
+    )?;
+    let Some(webhook) = webhook else {
+        return Ok(());
+    };
+    let webhook: Webhook = decode(&webhook)?;
+    if !webhook.events.iter().any(|allowed| allowed.name() == event) {
+        return Ok(());
+    }
+    let namespace = if kind == "crawl" {
+        "crawl"
+    } else {
+        "batch_scrape"
+    };
+    let event = format!("{namespace}.{event}");
+    let mut payload = serde_json::json!({"success": success, "type": event, "id": id,
+        "data": data, "metadata": webhook.metadata});
+    if let Some(error) = error {
+        payload["error"] = serde_json::json!(error);
+    }
+    tx.execute(
+        "INSERT INTO webhooks(job_id,event,payload,next_at) VALUES(?1,?2,?3,?4)",
+        params![id, event, encode(&payload)?, now_ms()],
+    )?;
+    Ok(())
+}
+
+fn scrub_webhook(tx: &Transaction<'_>, job: &str) -> Result<(), StoreError> {
+    tx.execute(
+        "UPDATE jobs SET spec=json_set(spec,'$.webhook',json('null'))
+        WHERE id=?1 AND status!='scraping' AND NOT EXISTS(
+            SELECT 1 FROM webhooks WHERE job_id=?1 AND delivered=0 AND attempts<3)",
+        [job],
+    )?;
+    Ok(())
+}
+
+pub async fn claim_webhook(store: &Store) -> Result<Option<webhooks::Delivery>, StoreError> {
+    store.write(|tx| {
+        let row = tx.query_row(
+            "SELECT w.id,w.payload,json_extract(j.spec,'$.webhook'),w.attempts FROM webhooks w JOIN jobs j ON j.id=w.job_id
+             WHERE w.delivered=0 AND w.attempts<3 AND w.next_at<=?1
+             ORDER BY w.next_at,w.id LIMIT 1", [now_ms()],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?, row.get::<_, u32>(3)?))).optional()?;
+        let Some((id, body, spec, attempts)) = row else { return Ok(None) };
+        let webhook: Webhook = decode(&spec)?;
+        // Reserve the full send timeout as well as backoff. Restart cannot race a live claim.
+        let backoff = if attempts == 0 { 5_000 } else { 60_000 };
+        tx.execute("UPDATE webhooks SET attempts=attempts+1,next_at=?2 WHERE id=?1",
+            params![id, now_ms().saturating_add(10_000 + backoff)])?;
+        Ok(Some(webhooks::Delivery { id, body, webhook, attempt: attempts + 1 }))
+    }).await
+}
+
+pub async fn webhook_result(
+    store: &Store,
+    id: i64,
+    attempt: u32,
+    success: bool,
+) -> Result<(), StoreError> {
+    store
+        .write(move |tx| {
+            let row: Option<(String, u32)> = tx
+                .query_row(
+                    "SELECT job_id,attempts FROM webhooks WHERE id=?1 AND attempts=?2",
+                    params![id, attempt],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            let Some((job, attempts)) = row else {
+                return Ok(());
+            };
+            let backoff = if attempts == 1 { 5_000 } else { 60_000 };
+            tx.execute(
+                "UPDATE webhooks SET delivered=?2,next_at=?3,
+            payload=CASE WHEN ?2 OR attempts>=3 THEN '{}' ELSE payload END WHERE id=?1",
+                params![id, success, now_ms().saturating_add(backoff)],
+            )?;
+            if !success && attempts >= 3 {
+                tracing::warn!(webhook_id = id, "webhook attempts exhausted");
+            }
+            scrub_webhook(tx, &job)?;
+            Ok(())
         })
         .await
 }
@@ -227,6 +369,7 @@ pub async fn submit(
                 "UPDATE jobs SET discovered=?2 WHERE id=?1",
                 params![id, pages],
             )?;
+            enqueue_webhook(tx, &id, "started", true, serde_json::json!([]), None)?;
             finish(tx, &id, retention)?;
             Ok(Some(()))
         })
@@ -261,10 +404,11 @@ pub async fn lease(store: &Store, job: String, host: String) -> Result<Option<Wo
             let Some((id, job_id, task, url, depth, attempts)) = row else {
                 return Ok(None);
             };
-            let spec: String =
-                tx.query_row("SELECT spec FROM jobs WHERE id=?1", [&job_id], |row| {
-                    row.get(0)
-                })?;
+            let (spec, request): (String, String) = tx.query_row(
+                "SELECT spec,request FROM jobs WHERE id=?1",
+                [&job_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
             let task = match task.as_str() {
                 "page" => Task::Page,
                 "sitemap" => Task::Sitemap,
@@ -279,6 +423,7 @@ pub async fn lease(store: &Store, job: String, host: String) -> Result<Option<Wo
                 task,
                 url: url.parse().map_err(|_| StoreError::Corrupt)?,
                 spec: decode(&spec)?,
+                formats: decode::<serde_json::Value>(&request)?["formats"].clone(),
             }))
         })
         .await
@@ -286,12 +431,26 @@ pub async fn lease(store: &Store, job: String, host: String) -> Result<Option<Wo
 
 fn finish(tx: &Transaction<'_>, id: &str, retention: u64) -> Result<(), StoreError> {
     let now = now_ms();
-    tx.execute(
+    let changed = tx.execute(
         "UPDATE jobs SET status=CASE WHEN completed=0 AND failed>0 THEN 'failed' ELSE 'completed' END,
          updated_ms=?2, expires_ms=?3, spec=json_set(spec,'$.scrape.headers',json('[]'))
          WHERE id=?1 AND status='scraping' AND NOT EXISTS(
           SELECT 1 FROM frontier INDEXED BY frontier_open WHERE job_id=?1 AND state IN ('queued','leased'))",
         params![id, now, expiry(now, retention)])?;
+    if changed != 0 {
+        let status: String = tx.query_row("SELECT status FROM jobs WHERE id=?1", [id], |row| {
+            row.get(0)
+        })?;
+        enqueue_webhook(
+            tx,
+            id,
+            &status,
+            status == "completed",
+            serde_json::json!([]),
+            None,
+        )?;
+        scrub_webhook(tx, id)?;
+    }
     Ok(())
 }
 
@@ -300,7 +459,16 @@ pub async fn complete(
     work: Work,
     out: Outcome,
     retention: u64,
+    document_encoder: DocumentEncoder,
 ) -> Result<(), StoreError> {
+    let page_data = if work.task == Task::Page && work.spec.webhook.is_some() {
+        out.doc
+            .as_ref()
+            .map(|doc| document_encoder(doc, &work.formats, work.url.as_str()))
+            .transpose()?
+    } else {
+        None
+    };
     let doc = out.doc.map(|doc| encode(&doc)).transpose()?;
     let backoff = (work.attempts as usize)
         .checked_sub(1)
@@ -325,6 +493,8 @@ pub async fn complete(
                 out.content_sha, out.capture_id, out.blob_sha256, out.error, now])?;
         if changed == 0 { return Ok(()); }
         if work.task == Task::Page {
+            enqueue_webhook(tx, &work.job_id, "page", out.error.is_none(),
+                serde_json::Value::Array(page_data.into_iter().collect()), out.error.as_deref())?;
             if let Some(doc) = doc {
                 tx.execute("UPDATE jobs SET completed=completed+1,updated_ms=?2 WHERE id=?1",
                     params![work.job_id, now])?;
@@ -477,6 +647,15 @@ pub async fn cancel(
              WHERE job_id=?1 AND state IN ('queued','leased')",
                 params![id, now],
             )?;
+            enqueue_webhook(
+                tx,
+                &id,
+                "failed",
+                false,
+                serde_json::json!([]),
+                Some("Job cancelled"),
+            )?;
+            scrub_webhook(tx, &id)?;
             Ok(Some(true))
         })
         .await
@@ -524,7 +703,8 @@ pub async fn sweep(store: &Store) -> Result<(), StoreError> {
     store
         .write(|tx| {
             tx.execute(
-                "DELETE FROM jobs WHERE expires_ms<=?1 AND status!='scraping'",
+                "DELETE FROM jobs WHERE expires_ms<=?1 AND status!='scraping'
+                 AND NOT EXISTS(SELECT 1 FROM webhooks WHERE job_id=jobs.id AND delivered=0 AND attempts<3)",
                 [now_ms()],
             )?;
             Ok(())

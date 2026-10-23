@@ -130,6 +130,11 @@ for blocks, otherwise the Firecrawl code) with `error`.
   empty success. A genuine zero-result search is an empty success with Firecrawl's warning text.
 - Search engine requests use the same `net` fetcher and guard.
 - `scrapeOptions.formats` non-empty scrapes each hit through `scrape` with bounded concurrency.
+- v1/v2 `tbs` accepts `qdr:h|d|w|m|y`: SearXNG receives `time_range`, DuckDuckGo
+  receives `df` (hour requests use the providers' minimum day window). Filtered requests never
+  fall through to providers that cannot honor them. v2 `sources: ["news"]` uses SearXNG's news
+  category and returns `data.news`; without `SEARXNG_ENDPOINT` it is a named 400. Combining web
+  and news in one request is not supported.
 
 ## Storage (`store`)
 
@@ -205,11 +210,23 @@ DECISIONS.md. Each slice is a module with one owner; `api` gains routes, `scrape
   own endpoint. A ten-minute sweeper deletes expired terminal jobs with cascading documents;
   retention defaults to 24 hours after completion. Raw captures remain independent of jobs.
 - Crawl headers are sent only to the seed host, removed from stored specifications at job end,
-  and never included in status or export records. Webhooks and full-URL regexes are rejected by
+  and never included in status or export records. Full-URL regexes are rejected by
   name; `maxConcurrency` and `deduplicateSimilarURLs` are accepted no-ops. Batch scrape options
   are top-level. New jobs are refused at the active-job ceiling or below the free-disk floor
   (`SONAR_MIN_FREE_DISK_MB`, default 2048; HTTP 507). Transient job-page failures are retried
   after 5 s and 30 s (3 attempts in all).
+- Crawl and batch `webhook` accepts a URL or `{url, headers?, metadata?, events?}`. Started,
+  page, completed, and failed events commit to the `webhooks` outbox with their job transition;
+  bodies use the shared API document serializer and Firecrawl's `crawl.*` / `batch_scrape.*`
+  envelopes. Four deliveries run at once through `Fetcher::post_json`: the same destination
+  guard, DNS pinning, gate and proxy budget, no redirects, and a ten-second deadline. Each event
+  gets at most three attempts, backing off five and sixty seconds; restart resumes pending work.
+  Delivery is not exactly-once: receivers must tolerate duplicates. `SONAR_WEBHOOK_SECRET`
+  adds `X-Sonar-Signature: sha256=<HMAC-SHA256 hex>` over the exact JSON bytes. Custom transport
+  and signature headers are refused. Webhook credentials are removed after terminal delivery
+  or exhaustion; expired jobs with pending attempts are retained until attempts finish.
+- `GET /v1/crawl/active` and `/v2/crawl/active` return active crawl IDs, seed URLs, and an explicit
+  public option subset; neither scrape headers nor webhook credentials are exposed.
 - `sonar export [--kind pages|search|all] [--since RFC3339] [--host SUFFIX] [--out PATH]` (default
   `pages`; `all` emits pages then searches) streams captures as JSON Lines,
   using the shared capture renderer, filtering failed/blocked/unsupported/empty pages, and
@@ -312,9 +329,9 @@ minutes (never below configured spacing); successful 2xx responses halve it towa
   `parsers: ["pdf"]` or `[{type:"pdf"}]` enables PDF parsing; `[]` disables it. Absent `maxAge`
   uses server configuration. `sitemap: skip|include|only` maps to shared discovery, with `only`
   disabling page-link discovery; crawl uses `maxDiscoveryDepth`, `crawlEntireDomain`, `allowSubdomains`.
-- Search defaults to 10 hits, accepts only web sources (string or `{type:"web"}`), and applies
+- Search defaults to 10 hits, accepts web or news sources (strings or `{type}`), and applies
   includeDomains or excludeDomains to returned hosts/subdomains before optional scraping; no refill.
-  `tbs`, `location`, source options, and other unsupported fields/formats/parsers get named 400s.
+  `location`, source options, and other unsupported fields/formats/parsers get named 400s.
   Shared v1 no-ops remain no-ops. Jobs reject screenshots, nonempty actions, and positive waitFor
   because workers do not execute browser plans. Legacy v1-only option names are rejected.
 
@@ -371,5 +388,17 @@ minutes (never below configured spacing); successful 2xx responses halve it towa
   schema in the same request, so no LLM call is made, and work without `SONAR_LLM_URL`. Jobs
   still reject the json format.
 
-Change tracking from stored captures and the company-signal layers remain later work in
-[BUILDOUT.md](BUILDOUT.md).
+
+### Change tracking
+
+- v1 `changeTracking` with optional `changeTrackingOptions: {modes: ["git-diff"]}` and v2
+  `{type: "changeTracking", modes?: ["git-diff"]}` require markdown. Both use the newest prior
+  successful stored capture matching the normalized requested or final URL, strictly before the
+  current capture's time and ID; failed pages and search exchanges never become the baseline.
+- The baseline is rendered with the current options. Exact markdown equality yields `same`,
+  differences `changed`, no baseline `new`, and a current 404/410 with a baseline `removed`.
+  `previousScrapeAt` is the baseline capture time (null for new), visibility is `visible`, and
+  requested git diffs use `similar`'s unified line diff on bounded rendering workers. Damaged
+  history fails instead of inventing a new page. Jobs persist comparison results with documents.
+
+The company-signal layers remain later work in [BUILDOUT.md](BUILDOUT.md).

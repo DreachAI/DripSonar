@@ -1,5 +1,21 @@
 # Decisions
 
+## 2026-10-22 — small codebase and shared agent roles
+
+The owner requested low LOC, high quality, and high modularity. Apply that to handwritten product
+code through cohesive modules, narrow interfaces, reuse, and focused behavioral evidence. Do not
+count reference checkouts as product size or compress code to meet an arbitrary numerical target.
+
+Adapt Dreach's shared role-question pattern into six roles: scout, designer, implementor, reviewer,
+validator, and judge. Canonical prompts and dispatch/clarification/closure runbooks live in `.agents/`.
+Native Codex and Claude bindings read those files instead of duplicating them, so no generator or
+full model ladder is needed. The roles guide useful work; no mandatory council/review ceremony is added.
+
+Native format sources are the [Codex subagent docs](https://learn.chatgpt.com/docs/agent-configuration/subagents)
+and [Claude Code subagent docs](https://code.claude.com/docs/en/sub-agents), checked 2026-10-22.
+Local definition checks do not establish runtime discovery or model access. No global client
+settings, permission bypasses, API credentials, or automatic agent jobs are introduced.
+
 ## 2026-10-22 — purpose and first user flow
 
 The owner selected company research and specific business signals as the first use case.

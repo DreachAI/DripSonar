@@ -17,19 +17,22 @@ deployed or benchmarked.
 | Path | Purpose |
 | --- | --- |
 | [AGENTS.md](AGENTS.md) | Instructions for agents; `CLAUDE.md` imports the same file |
+| [.agents/](.agents/README.md) | Shared role questions and runbooks; native bindings in `.codex/` and `.claude/` |
 | [docs/](docs/README.md) | Buildout, code conventions, decisions, and tool research |
 | [references/](references/README.md) | Pinned upstream source for inspection |
 
 ## Check out the reference
 
 ```bash
-git clone --recurse-submodules https://github.com/DreachAI/DripSonar.git
+git clone https://github.com/DreachAI/DripSonar.git
+cd DripSonar
+git submodule update --init --depth 1
 ```
 
 For an existing checkout:
 
 ```bash
-git submodule update --init --depth 1 references/firecrawl
+git submodule update --init --depth 1
 git submodule status
 ```
 

@@ -12,8 +12,12 @@ Remote: `DreachAI/DripSonar` (private). Current scope and proof live in `docs/BU
   guidance only when relevant; the table below is an index, not a required reading collection.
 - Make the smallest useful change. Find the existing owner before adding a mechanism. One
   authoritative home per rule; remove what the change supersedes without unrelated cleanup.
+- Target low handwritten LOC, high quality, and high modularity: cohesive modules, small explicit
+  interfaces, and minimal dependencies. Never trade correctness or readability for fewer lines.
 - Use subagents when useful. Give each a bounded question or exact write paths; one writer per
   path and one operator per live resource. Reviews and councils are tools, not mandatory quotas.
+- Use the shared roles and handoff runbook in `.agents/README.md`. Subagents investigate before
+  asking; escalate only decision-changing unknowns to the parent and stop after their handoff.
 - Preserve unrelated work. Use recoverable backups for substantial deletion; never force-push.
 - Keep commits coherent and descriptive. Do not invent issue IDs, tracking teams, or AI attribution.
 
@@ -21,6 +25,7 @@ Remote: `DreachAI/DripSonar` (private). Current scope and proof live in `docs/BU
 | --- | --- |
 | Scoping work or checking current capabilities | `docs/BUILDOUT.md` |
 | Writing or reviewing code | `docs/CODE_STYLE.md` |
+| Delegating, clarifying, or closing a subagent | `.agents/README.md` |
 | Changing a project decision | `docs/DECISIONS.md` |
 | Choosing a library or studying a provider | `docs/RESEARCH.md` |
 | Reading or updating upstream source | `references/README.md` |

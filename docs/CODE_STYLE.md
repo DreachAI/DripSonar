@@ -3,6 +3,18 @@
 Adapted from Dreach's engineering conventions; source revisions are in [DECISIONS.md](DECISIONS.md).
 These rules apply when implementation begins. They are not claims that lint or build gates exist.
 
+The target is **low handwritten LOC, high quality, and high modularity**. Prefer the smallest
+readable implementation that satisfies the behavior and its failure cases. Reference checkouts
+and generated/vendor code are not product LOC; keep them separate when reporting code size.
+
+- A module owns one reason to change and exposes the smallest useful interface. Keep dependencies
+  directional; avoid cycles, public internals, pass-through layers, and one-file-per-trivial-function
+  fragmentation. Add a trait, crate, plugin system, or service only for a concrete consumer or boundary.
+- Count complexity as well as lines: dependencies, concepts, public APIs, and operational components.
+  Do not compress statements, hide behavior in clever macros, or remove validation/tests to lower LOC.
+- Review quality through observable correctness, clear failure behavior, and maintainable boundaries.
+  An unsupported numerical quality score is not evidence. Report net handwritten lines when useful,
+  with the behavior or duplication that justified growth; no arbitrary LOC gate overrides correctness.
 - Search for existing types and owners before writing. Keep modules named after their purpose;
   avoid catch-all `utils`, `helpers`, and speculative frameworks. Split at real ownership boundaries.
 - Use maintained crates for standard protocols. Start with the smallest useful Rust package;

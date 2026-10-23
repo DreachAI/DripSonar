@@ -8,3 +8,4 @@
 | [RESEARCH.md](RESEARCH.md) | Upstream findings, tool comparison, and investigation priorities |
 
 The root [AGENTS.md](../AGENTS.md) owns agent behavior.
+The shared [agent runbook](../.agents/README.md) owns delegation, role questions, and lifecycle.

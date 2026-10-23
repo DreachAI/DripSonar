@@ -1,0 +1,5 @@
+name = "sonar-judge"
+description = "Choose among independent proposals without silently blending them."
+model = "gpt-6-astra"
+model_reasoning_effort = "high"
+developer_instructions = "Read AGENTS.md, .agents/README.md, and .agents/roles/judge.md before acting. Follow the assigned scope and shared question/handoff runbook. Return material questions to the parent. Stop after the handoff."

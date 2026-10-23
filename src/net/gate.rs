@@ -47,16 +47,17 @@ impl Gate {
         }
     }
 
-    /// Takes global capacity before booking host spacing, so global contention cannot bunch starts.
+    /// Takes the host permit first, so waiters on one busy host never hold global capacity, then
+    /// global capacity before booking host spacing, so global contention cannot bunch starts.
     pub(super) async fn enter(&self, host: &str, deadline: Instant) -> Result<Pass, FetchError> {
-        let global = timeout_at(deadline, Arc::clone(&self.global).acquire_owned())
-            .await
-            .map_err(|_| FetchError::Overloaded)?
-            .map_err(|_| FetchError::Protocol)?;
         let slot = self.slot(host);
         let host_permit = timeout_at(deadline, Arc::clone(&slot.permits).acquire_owned())
             .await
             .map_err(|_| FetchError::Timeout)?
+            .map_err(|_| FetchError::Protocol)?;
+        let global = timeout_at(deadline, Arc::clone(&self.global).acquire_owned())
+            .await
+            .map_err(|_| FetchError::Overloaded)?
             .map_err(|_| FetchError::Protocol)?;
         let start = {
             let mut next = slot

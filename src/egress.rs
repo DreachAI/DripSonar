@@ -27,6 +27,22 @@ pub enum Route {
 }
 
 impl Route {
+    /// The stored and cache-key spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Direct => "direct",
+            Self::Proxy => "proxy",
+        }
+    }
+
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "direct" => Some(Self::Direct),
+            "proxy" => Some(Self::Proxy),
+            _ => None,
+        }
+    }
+
     pub fn proxy_used(self) -> &'static str {
         match self {
             Self::Direct => "basic",

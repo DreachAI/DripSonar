@@ -1,19 +1,22 @@
 //! SQLite capture index and content-addressed blob files.
 //!
 //! Captures are appended, never updated. A blob is durable before its row exists, so a crash
-//! leaves at most an orphan blob, never a row without content.
+//! leaves at most an orphan blob, never a row without content. One writer thread owns every
+//! write; blob unlinks run there too, so a row insert always sees its blob or rewrites it.
 
 use std::{
     fs::{self, File},
     io::{self, Write},
+    panic::{AssertUnwindSafe, catch_unwind},
     path::{Path, PathBuf},
     sync::{Arc, Mutex, PoisonError},
-    time::Duration,
+    time::{Duration, SystemTime},
 };
 
-use rusqlite::{Connection, OpenFlags, OptionalExtension, params};
+use rusqlite::{Connection, OpenFlags, OptionalExtension, Transaction, params};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::net::{Fetched, Route};
 
@@ -32,6 +35,17 @@ CREATE TABLE IF NOT EXISTS captures (
     route TEXT
 );
 CREATE INDEX IF NOT EXISTS captures_by_key ON captures (cache_key, fetched_at_ms);
+CREATE INDEX IF NOT EXISTS captures_by_time ON captures (fetched_at_ms);
+CREATE INDEX IF NOT EXISTS captures_by_blob ON captures (blob_sha256);
+CREATE TABLE IF NOT EXISTS searches (
+    id INTEGER PRIMARY KEY,
+    query TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    lang TEXT NOT NULL,
+    fetched_at_ms INTEGER NOT NULL,
+    hits TEXT,
+    capture_id INTEGER NOT NULL UNIQUE REFERENCES captures(id) ON DELETE CASCADE
+);
 ";
 
 /// Expiring capability-addressed files (browser screenshots); blobs live under `blobs/artifacts`.
@@ -48,6 +62,21 @@ CREATE INDEX IF NOT EXISTS artifacts_by_expiry ON artifacts (expires_at_ms);
 CREATE INDEX IF NOT EXISTS artifacts_by_blob ON artifacts (blob_sha256);
 ";
 
+const CAPTURE_COLUMNS: &str = "id, requested_url, final_url, status, headers, content_type, \
+                               blob_sha256, fetched_at_ms, route, tier";
+const CAPTURE_REFERENCED: &str = "SELECT EXISTS(SELECT 1 FROM captures WHERE blob_sha256 = ?1)";
+const ARTIFACT_REFERENCED: &str = "SELECT EXISTS(SELECT 1 FROM artifacts WHERE blob_sha256 = ?1)";
+
+/// Captures older than this are deleted by [`Store::sweep`], with their search rows.
+pub const CAPTURE_RETENTION: Duration = Duration::from_secs(30 * 24 * 3600);
+/// Capture rows deleted per writer transaction, and transactions per sweep.
+const SWEEP_BATCH: usize = 1000;
+const SWEEP_BATCHES: usize = 50;
+/// Blob files examined per root per sweep, resuming where the previous sweep stopped.
+const ORPHAN_SCAN: usize = 10_000;
+/// Younger unreferenced blobs may belong to a write whose row is still queued.
+const ORPHAN_GRACE: Duration = Duration::from_secs(3600);
+
 /// Which engine produced a capture; rows written before the column existed are HTTP.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Tier {
@@ -55,10 +84,20 @@ pub enum Tier {
     Browser,
 }
 
-/// Idle read-only connections kept for reuse; bursts beyond this open short-lived extras.
-const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+impl Tier {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Http => "http",
+            Self::Browser => "browser",
+        }
+    }
+}
 
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// Idle read-only connections kept for reuse; bursts beyond this open short-lived extras.
 const IDLE_READERS: usize = 8;
+/// Writes queued for the writer thread before callers wait.
+const WRITE_QUEUE: usize = 256;
 
 /// Response headers never persisted: they carry session credentials.
 const UNSTORED_HEADERS: [&str; 1] = ["set-cookie"];
@@ -77,11 +116,13 @@ pub enum StoreError {
     Quota,
 }
 
-/// One writer connection plus reusable read-only connections, so cache lookups never queue
+type WriteJob = Box<dyn FnOnce(&mut Connection) + Send>;
+
+/// The writer thread's queue plus reusable read-only connections, so cache lookups never queue
 /// behind an insert (WAL lets readers run beside the writer).
 struct Db {
     path: PathBuf,
-    writer: Mutex<Connection>,
+    writer: mpsc::Sender<WriteJob>,
     readers: Mutex<Vec<Connection>>,
 }
 
@@ -118,9 +159,10 @@ pub struct Store {
     db: Arc<Db>,
     blobs: PathBuf,
     artifacts: PathBuf,
-    /// Serializes artifact publishing and sweeping, so a sweep never unlinks a blob that a
-    /// publish has written but not yet referenced, and the quota check holds until the insert.
+    /// Serializes artifact publishing, so the quota check holds until the insert.
     artifact_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Last blob name examined per root (captures, artifacts) by the orphan scan.
+    orphan_cursors: Arc<Mutex<[String; 2]>>,
 }
 
 pub struct Capture {
@@ -130,48 +172,25 @@ pub struct Capture {
     pub fetched: Fetched,
 }
 
+/// One recorded search-provider exchange whose response parsed.
+pub struct StoredSearch {
+    pub id: i64,
+    pub query: String,
+    pub provider: String,
+    pub fetched_at: OffsetDateTime,
+    /// JSON array of the parsed hits.
+    pub hits: String,
+    pub capture_id: i64,
+}
+
 impl Store {
-    /// Runs job SQL on the existing writer; a failed closure rolls back the whole transaction.
-    pub async fn write<T: Send + 'static>(
-        &self,
-        f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T, StoreError> + Send + 'static,
-    ) -> Result<T, StoreError> {
-        let db = Arc::clone(&self.db);
-        tokio::task::spawn_blocking(move || {
-            let mut writer = db.writer.lock().unwrap_or_else(PoisonError::into_inner);
-            let tx = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let result = f(&tx)?;
-            tx.commit()?;
-            Ok(result)
-        })
-        .await
-        .map_err(|_| StoreError::Task)?
-    }
-
-    pub async fn read<T: Send + 'static>(
-        &self,
-        f: impl FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
-    ) -> Result<T, StoreError> {
-        let db = Arc::clone(&self.db);
-        tokio::task::spawn_blocking(move || {
-            let conn = db.reader()?;
-            let result = f(&conn);
-            if result.is_ok() {
-                db.recycle(conn);
-            }
-            result
-        })
-        .await
-        .map_err(|_| StoreError::Task)?
-    }
-
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         let blobs = dir.join("blobs").join("sha256");
         fs::create_dir_all(&blobs)?;
         let artifacts = dir.join("blobs").join("artifacts");
         fs::create_dir_all(&artifacts)?;
         let path = dir.join("sonar.db");
-        let writer = Connection::open(&path)?;
+        let mut writer = Connection::open(&path)?;
         writer.busy_timeout(BUSY_TIMEOUT)?;
         writer
             .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))?;
@@ -182,79 +201,237 @@ impl Store {
         writer.execute_batch(SCHEMA)?;
         writer.execute_batch(ARTIFACTS_SCHEMA)?;
         // Serialize schema inspection and ALTER across simultaneous opens of an old store.
-        let writer = {
-            let mut writer = writer;
-            let tx = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-            let has_route: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('captures') WHERE name = 'route')",
-                [],
+        let tx = writer.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        for column in ["route", "tier"] {
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('captures') WHERE name = ?1)",
+                [column],
                 |row| row.get(0),
             )?;
-            if !has_route {
-                tx.execute_batch("ALTER TABLE captures ADD COLUMN route TEXT")?;
+            if !exists {
+                tx.execute_batch(&format!("ALTER TABLE captures ADD COLUMN {column} TEXT"))?;
             }
-            let has_tier: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('captures') WHERE name = 'tier')",
-                [],
-                |row| row.get(0),
-            )?;
-            if !has_tier {
-                tx.execute_batch("ALTER TABLE captures ADD COLUMN tier TEXT")?;
-            }
-            tx.commit()?;
-            writer
-        };
+        }
+        tx.commit()?;
+        let (sender, mut queue) = mpsc::channel::<WriteJob>(WRITE_QUEUE);
+        // Exits once every Store clone, and so every sender, is gone.
+        std::thread::Builder::new()
+            .name("sonar-store-writer".into())
+            .spawn(move || {
+                while let Some(job) = queue.blocking_recv() {
+                    // A panicking write fails only its caller (the reply is dropped).
+                    let _ = catch_unwind(AssertUnwindSafe(|| job(&mut writer)));
+                }
+            })?;
         Ok(Self {
             db: Arc::new(Db {
                 path,
-                writer: Mutex::new(writer),
+                writer: sender,
                 readers: Mutex::new(Vec::new()),
             }),
             blobs,
             artifacts,
             artifact_lock: Arc::default(),
+            orphan_cursors: Arc::default(),
         })
+    }
+
+    /// Runs job SQL on the writer thread; a failed closure rolls back the whole transaction.
+    /// Once queued, the write completes even if the caller is cancelled.
+    pub async fn write<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Transaction<'_>) -> Result<T, StoreError> + Send + 'static,
+    ) -> Result<T, StoreError> {
+        self.on_writer(move |conn| {
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let result = f(&tx)?;
+            tx.commit()?;
+            Ok(result)
+        })
+        .await
+    }
+
+    async fn on_writer<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&mut Connection) -> Result<T, StoreError> + Send + 'static,
+    ) -> Result<T, StoreError> {
+        let (reply, result) = oneshot::channel();
+        let job: WriteJob = Box::new(move |conn| {
+            let _ = reply.send(f(conn));
+        });
+        self.db
+            .writer
+            .send(job)
+            .await
+            .map_err(|_| StoreError::Task)?;
+        result.await.map_err(|_| StoreError::Task)?
+    }
+
+    pub async fn read<T: Send + 'static>(
+        &self,
+        f: impl FnOnce(&Connection) -> Result<T, StoreError> + Send + 'static,
+    ) -> Result<T, StoreError> {
+        let db = Arc::clone(&self.db);
+        blocking(move || {
+            let conn = db.reader()?;
+            let result = f(&conn);
+            // Only a connection that just answered is worth reusing.
+            if result.is_ok() {
+                db.recycle(conn);
+            }
+            result
+        })
+        .await
     }
 
     /// The newest 2xx capture for `key` no older than `max_age`, or `None` when absent or its
     /// blob is gone.
-    pub async fn cached(
-        &self,
-        key: &str,
-        max_age: Duration,
-    ) -> Result<Option<Fetched>, StoreError> {
-        Ok(self
-            .cached_capture(key, max_age)
-            .await?
-            .map(|capture| capture.fetched))
-    }
-
     pub async fn cached_capture(
         &self,
         key: &str,
         max_age: Duration,
     ) -> Result<Option<Capture>, StoreError> {
-        let (store, key) = (self.clone(), key.to_owned());
-        tokio::task::spawn_blocking(move || store.cached_blocking(&key, max_age))
-            .await
-            .map_err(|_| StoreError::Task)?
+        let max_age_ms = i64::try_from(max_age.as_millis()).unwrap_or(i64::MAX);
+        let since = unix_ms(OffsetDateTime::now_utc())?.saturating_sub(max_age_ms);
+        let (blobs, key) = (self.blobs.clone(), key.to_owned());
+        self.read(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {CAPTURE_COLUMNS} FROM captures
+                 WHERE cache_key = ?1 AND fetched_at_ms >= ?2 AND status BETWEEN 200 AND 299
+                 ORDER BY fetched_at_ms DESC, id DESC LIMIT 1"
+            ))?;
+            let mut rows = stmt.query(params![key, since])?;
+            match rows.next()? {
+                Some(row) => read_capture(&blobs, row),
+                None => Ok(None),
+            }
+        })
+        .await
+    }
+
+    /// Page captures (not search exchanges) after `after_id` in ID order, and the cursor for the
+    /// next call. Rows whose blob vanished meanwhile are skipped.
+    pub async fn captures_after(
+        &self,
+        after_id: i64,
+        n: usize,
+    ) -> Result<(Vec<Capture>, i64), StoreError> {
+        let blobs = self.blobs.clone();
+        self.read(move |conn| {
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {CAPTURE_COLUMNS} FROM captures WHERE id > ?1
+                 AND NOT EXISTS(SELECT 1 FROM searches WHERE capture_id = captures.id)
+                 ORDER BY id LIMIT ?2"
+            ))?;
+            let mut rows = stmt.query(params![after_id, n.clamp(1, 1000) as i64])?;
+            let (mut captures, mut next) = (Vec::new(), after_id);
+            while let Some(row) = rows.next()? {
+                next = row.get(0)?;
+                captures.extend(read_capture(&blobs, row)?);
+            }
+            Ok((captures, next))
+        })
+        .await
+    }
+
+    /// Recorded search exchanges after `after_id` in ID order.
+    pub async fn searches_after(
+        &self,
+        after_id: i64,
+        n: usize,
+    ) -> Result<Vec<StoredSearch>, StoreError> {
+        self.read(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT id, query, provider, fetched_at_ms, hits, capture_id FROM searches
+                 WHERE id > ?1 AND hits IS NOT NULL ORDER BY id LIMIT ?2",
+            )?;
+            let rows = stmt
+                .query_map(params![after_id, n.clamp(1, 1000) as i64], |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|(id, query, provider, at, hits, capture_id)| {
+                    Ok(StoredSearch {
+                        id,
+                        query,
+                        provider,
+                        fetched_at: from_unix_ms(at)?,
+                        hits,
+                        capture_id,
+                    })
+                })
+                .collect()
+        })
+        .await
     }
 
     /// Appends a capture: blob file first (temp, fsync, rename), then its row.
     pub async fn put(&self, key: &str, fetched: &Fetched) -> Result<i64, StoreError> {
-        self.put_tier(key, fetched, Tier::Http).await
+        self.put_with(key, fetched, Tier::Http, |_, _| Ok(())).await
     }
 
     /// Appends a browser capture; its body is the rendered DOM as UTF-8 HTML.
     pub async fn put_rendered(&self, key: &str, fetched: &Fetched) -> Result<i64, StoreError> {
-        self.put_tier(key, fetched, Tier::Browser).await
+        self.put_with(key, fetched, Tier::Browser, |_, _| Ok(()))
+            .await
     }
 
-    async fn put_tier(&self, key: &str, fetched: &Fetched, tier: Tier) -> Result<i64, StoreError> {
-        let (store, key, fetched) = (self.clone(), key.to_owned(), fetched.clone());
-        tokio::task::spawn_blocking(move || store.put_blocking(&key, &fetched, tier))
-            .await
-            .map_err(|_| StoreError::Task)?
+    /// Appends one search-provider exchange as a capture plus its `searches` row. `hits` is
+    /// `None` when the response did not parse: the capture stays evidence, never a result.
+    pub async fn put_search<H: serde::Serialize + ?Sized>(
+        &self,
+        key: &str,
+        fetched: &Fetched,
+        query: &str,
+        provider: &str,
+        lang: &str,
+        hits: Option<&H>,
+    ) -> Result<i64, StoreError> {
+        let hits = hits
+            .map(serde_json::to_string)
+            .transpose()
+            .map_err(|_| StoreError::Corrupt)?;
+        let (query, provider, lang) = (query.to_owned(), provider.to_owned(), lang.to_owned());
+        let at = unix_ms(fetched.fetched_at)?;
+        self.put_with(key, fetched, Tier::Http, move |tx, capture| {
+            tx.execute(
+                "INSERT INTO searches (query, provider, lang, fetched_at_ms, hits, capture_id)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![query, provider, lang, at, hits, capture],
+            )?;
+            Ok(())
+        })
+        .await
+    }
+
+    /// Writes the blob off the writer thread, then inserts the capture row and any `extra` rows
+    /// in one writer transaction, rewriting the blob first if a sweep removed it meanwhile.
+    async fn put_with(
+        &self,
+        key: &str,
+        fetched: &Fetched,
+        tier: Tier,
+        extra: impl FnOnce(&Transaction<'_>, i64) -> Result<(), StoreError> + Send + 'static,
+    ) -> Result<i64, StoreError> {
+        let hash = sha256_hex(&fetched.body);
+        let (root, name, body) = (self.blobs.clone(), hash.clone(), fetched.body.clone());
+        blocking(move || Ok(write_blob(&root, &name, &body)?)).await?;
+        let (root, key, fetched) = (self.blobs.clone(), key.to_owned(), fetched.clone());
+        self.write(move |tx| {
+            write_blob(&root, &hash, &fetched.body)?;
+            let id = insert_capture(tx, &key, &fetched, &hash, tier)?;
+            extra(tx, id)?;
+            Ok(id)
+        })
+        .await
     }
 
     /// Stores `body` under a new random capability ID that expires after `ttl`. The total size
@@ -266,312 +443,289 @@ impl Store {
         ttl: Duration,
         quota: u64,
     ) -> Result<String, StoreError> {
-        let store = self.clone();
-        let guard = Arc::clone(&self.artifact_lock).lock_owned().await;
-        tokio::task::spawn_blocking(move || {
-            let _guard = guard;
-            store.put_artifact_blocking(&body, media_type, ttl, quota)
-        })
-        .await
-        .map_err(|_| StoreError::Task)?
-    }
-
-    /// An unexpired artifact's media type and bytes.
-    pub async fn artifact(&self, id: &str) -> Result<Option<(String, Vec<u8>)>, StoreError> {
-        let (store, id) = (self.clone(), id.to_owned());
-        tokio::task::spawn_blocking(move || store.artifact_blocking(&id))
-            .await
-            .map_err(|_| StoreError::Task)?
-    }
-
-    /// Deletes expired artifact rows, then blob files no remaining row references.
-    pub async fn sweep_artifacts(&self) -> Result<usize, StoreError> {
-        let store = self.clone();
-        let guard = Arc::clone(&self.artifact_lock).lock_owned().await;
-        tokio::task::spawn_blocking(move || {
-            let _guard = guard;
-            store.sweep_artifacts_blocking()
-        })
-        .await
-        .map_err(|_| StoreError::Task)?
-    }
-
-    fn cached_blocking(&self, key: &str, max_age: Duration) -> Result<Option<Capture>, StoreError> {
-        let max_age_ms = i64::try_from(max_age.as_millis()).unwrap_or(i64::MAX);
-        let since = unix_ms(OffsetDateTime::now_utc())?.saturating_sub(max_age_ms);
-        let row = {
-            let db = self.db.reader()?;
-            let row = db
-                .query_row(
-                    "SELECT requested_url, final_url, status, headers, content_type, blob_sha256,
-                        fetched_at_ms, route, id, tier
-                 FROM captures
-                 WHERE cache_key = ?1 AND fetched_at_ms >= ?2 AND status BETWEEN 200 AND 299
-                 ORDER BY fetched_at_ms DESC, id DESC LIMIT 1",
-                    params![key, since],
-                    |row| {
-                        Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, u16>(2)?,
-                            row.get::<_, String>(3)?,
-                            row.get::<_, Option<String>>(4)?,
-                            row.get::<_, String>(5)?,
-                            row.get::<_, i64>(6)?,
-                            row.get::<_, Option<String>>(7)?,
-                            row.get::<_, i64>(8)?,
-                            row.get::<_, Option<String>>(9)?,
-                        ))
-                    },
-                )
-                .optional();
-            // Only a connection that just answered is worth reusing.
-            if row.is_ok() {
-                self.db.recycle(db);
-            }
-            row?
-        };
-        let Some((
-            requested,
-            final_url,
-            status,
-            headers,
-            content_type,
-            hash,
-            fetched_at,
-            route,
-            id,
-            tier,
-        )) = row
-        else {
-            return Ok(None);
-        };
-        let body = match fs::read(self.blob_path(&hash)) {
-            Ok(body) => body,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-            Err(e) => return Err(e.into()),
-        };
-        Ok(Some(Capture {
-            id,
-            blob_sha256: hash,
-            tier: stored_tier(tier.as_deref())?,
-            fetched: Fetched {
-                route: match route.as_deref() {
-                    None | Some("direct") => Route::Direct,
-                    Some("proxy") => Route::Proxy,
-                    _ => return Err(StoreError::Corrupt),
-                },
-                requested_url: requested.parse().map_err(|_| StoreError::Corrupt)?,
-                final_url: final_url.parse().map_err(|_| StoreError::Corrupt)?,
-                status,
-                headers: serde_json::from_str(&headers).map_err(|_| StoreError::Corrupt)?,
-                content_type,
-                body: body.into(),
-                fetched_at: OffsetDateTime::from_unix_timestamp_nanos(
-                    i128::from(fetched_at) * 1_000_000,
-                )
-                .map_err(|_| StoreError::Corrupt)?,
-            },
-        }))
-    }
-
-    pub async fn captures_after(
-        &self,
-        after_id: i64,
-        n: usize,
-    ) -> Result<Vec<Capture>, StoreError> {
-        let store = self.clone();
-        tokio::task::spawn_blocking(move || {
-            let conn = store.db.reader()?;
-            let mut stmt = conn.prepare("SELECT id, requested_url, final_url, status, headers, content_type, blob_sha256, fetched_at_ms, route, tier FROM captures WHERE id > ?1 ORDER BY id LIMIT ?2")?;
-            let rows = stmt.query_map(params![after_id, n.min(1000) as i64], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?, row.get::<_, String>(2)?, row.get::<_, u16>(3)?, row.get::<_, String>(4)?, row.get::<_, Option<String>>(5)?, row.get::<_, String>(6)?, row.get::<_, i64>(7)?, row.get::<_, Option<String>>(8)?, row.get::<_, Option<String>>(9)?))
-            })?.collect::<Result<Vec<_>, _>>()?;
-            drop(stmt);
-            store.db.recycle(conn);
-            rows.into_iter().map(|(id, requested, final_url, status, headers, content_type, hash, at, route, tier)| {
-                let body = fs::read(store.blob_path(&hash))?;
-                Ok(Capture { id, blob_sha256: hash, tier: stored_tier(tier.as_deref())?, fetched: Fetched {
-                    requested_url: requested.parse().map_err(|_| StoreError::Corrupt)?,
-                    final_url: final_url.parse().map_err(|_| StoreError::Corrupt)?, status,
-                    headers: serde_json::from_str(&headers).map_err(|_| StoreError::Corrupt)?, content_type, body: body.into(),
-                    fetched_at: OffsetDateTime::from_unix_timestamp_nanos(i128::from(at) * 1_000_000).map_err(|_| StoreError::Corrupt)?,
-                    route: match route.as_deref() { None | Some("direct") => Route::Direct, Some("proxy") => Route::Proxy, _ => return Err(StoreError::Corrupt) },
-                }})
-            }).collect()
-        }).await.map_err(|_| StoreError::Task)?
-    }
-
-    fn put_blocking(&self, key: &str, fetched: &Fetched, tier: Tier) -> Result<i64, StoreError> {
-        let hash = sha256_hex(&fetched.body);
-        write_blob(&self.blobs, &hash, &fetched.body)?;
-        let headers: Vec<_> = fetched
-            .headers
-            .iter()
-            .filter(|(name, _)| {
-                !UNSTORED_HEADERS
-                    .iter()
-                    .any(|h| name.eq_ignore_ascii_case(h))
-            })
-            .collect();
-        let headers = serde_json::to_string(&headers).map_err(|_| StoreError::Corrupt)?;
-        let db = self
-            .db
-            .writer
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        db.execute(
-            "INSERT INTO captures (cache_key, requested_url, final_url, status, headers,
-                                   content_type, blob_sha256, byte_len, fetched_at_ms, route, tier)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
-            params![
-                key,
-                fetched.requested_url.as_str(),
-                fetched.final_url.as_str(),
-                fetched.status,
-                headers,
-                fetched.content_type,
-                hash,
-                i64::try_from(fetched.body.len()).map_err(|_| StoreError::Corrupt)?,
-                unix_ms(fetched.fetched_at)?,
-                match fetched.route {
-                    Route::Direct => "direct",
-                    Route::Proxy => "proxy",
-                },
-                match tier {
-                    Tier::Http => "http",
-                    Tier::Browser => "browser",
-                },
-            ],
-        )?;
-        Ok(db.last_insert_rowid())
-    }
-
-    fn blob_path(&self, hash: &str) -> PathBuf {
-        blob_path(&self.blobs, hash)
-    }
-
-    /// Runs under the artifact lock, so the quota check stays true until the insert.
-    fn put_artifact_blocking(
-        &self,
-        body: &[u8],
-        media_type: &str,
-        ttl: Duration,
-        quota: u64,
-    ) -> Result<String, StoreError> {
         let len = i64::try_from(body.len()).map_err(|_| StoreError::Quota)?;
         let quota = i64::try_from(quota).unwrap_or(i64::MAX);
-        let used: i64 = {
-            let db = self.db.reader()?;
-            let used = db.query_row(
-                "SELECT COALESCE(SUM(byte_len), 0) FROM artifacts",
-                [],
-                |row| row.get(0),
-            );
-            if used.is_ok() {
-                self.db.recycle(db);
-            }
-            used?
-        };
+        // Held until the insert runs on the writer thread, even if this caller is cancelled.
+        let guard = Arc::clone(&self.artifact_lock).lock_owned().await;
+        let used: i64 = self
+            .read(|conn| {
+                Ok(conn.query_row(
+                    "SELECT COALESCE(SUM(byte_len), 0) FROM artifacts",
+                    [],
+                    |row| row.get(0),
+                )?)
+            })
+            .await?;
         if used.saturating_add(len) > quota {
             return Err(StoreError::Quota);
         }
-        let hash = sha256_hex(body);
-        write_blob(&self.artifacts, &hash, body)?;
+        let hash = sha256_hex(&body);
+        let body = Arc::new(body);
+        let (root, name, bytes) = (self.artifacts.clone(), hash.clone(), Arc::clone(&body));
+        blocking(move || Ok(write_blob(&root, &name, &bytes)?)).await?;
         let id = format!(
             "{}{}",
             uuid::Uuid::new_v4().simple(),
             uuid::Uuid::new_v4().simple()
         );
         let now = unix_ms(OffsetDateTime::now_utc())?;
-        let ttl_ms = i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX);
-        let db = self
-            .db
-            .writer
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        let inserted = db.execute(
-            "INSERT INTO artifacts (id, blob_sha256, media_type, byte_len, created_at_ms, expires_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![id, hash, media_type, len, now, now.saturating_add(ttl_ms)],
-        );
-        if let Err(error) = inserted {
-            // When the check itself fails, keep the blob: an orphan is harmless.
-            if matches!(artifact_referenced(&db, &hash), Ok(false)) {
-                let _ = fs::remove_file(blob_path(&self.artifacts, &hash));
+        let expires = now.saturating_add(i64::try_from(ttl.as_millis()).unwrap_or(i64::MAX));
+        let root = self.artifacts.clone();
+        self.on_writer(move |conn| {
+            let _guard = guard;
+            write_blob(&root, &hash, &body)?;
+            let inserted = conn.execute(
+                "INSERT INTO artifacts (id, blob_sha256, media_type, byte_len, created_at_ms, expires_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![id, hash, media_type, len, now, expires],
+            );
+            if let Err(error) = inserted {
+                // A failed cleanup only leaves an orphan for the sweep; report the insert.
+                let _ = remove_unreferenced(conn, ARTIFACT_REFERENCED, &root, vec![hash]);
+                return Err(error.into());
             }
-            return Err(error.into());
-        }
-        Ok(id)
+            Ok(id)
+        })
+        .await
     }
 
-    fn artifact_blocking(&self, id: &str) -> Result<Option<(String, Vec<u8>)>, StoreError> {
+    /// An unexpired artifact's media type and bytes.
+    pub async fn artifact(&self, id: &str) -> Result<Option<(String, Vec<u8>)>, StoreError> {
         let now = unix_ms(OffsetDateTime::now_utc())?;
-        let row = {
-            let db = self.db.reader()?;
-            let row = db
+        let (root, id) = (self.artifacts.clone(), id.to_owned());
+        self.read(move |conn| {
+            let row = conn
                 .query_row(
                     "SELECT media_type, blob_sha256 FROM artifacts WHERE id = ?1 AND expires_at_ms > ?2",
                     params![id, now],
                     |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
                 )
-                .optional();
-            if row.is_ok() {
-                self.db.recycle(db);
+                .optional()?;
+            let Some((media_type, hash)) = row else {
+                return Ok(None);
+            };
+            match fs::read(blob_path(&root, &hash)) {
+                Ok(body) => Ok(Some((media_type, body))),
+                Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+                Err(e) => Err(e.into()),
             }
-            row?
-        };
-        let Some((media_type, hash)) = row else {
-            return Ok(None);
-        };
-        match fs::read(blob_path(&self.artifacts, &hash)) {
-            Ok(body) => Ok(Some((media_type, body))),
-            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
-            Err(e) => Err(e.into()),
-        }
+        })
+        .await
     }
 
-    fn sweep_artifacts_blocking(&self) -> Result<usize, StoreError> {
+    /// Deletes expired artifact rows, then blob files no remaining row references.
+    pub async fn sweep_artifacts(&self) -> Result<usize, StoreError> {
         let now = unix_ms(OffsetDateTime::now_utc())?;
-        let unreferenced = {
-            let mut db = self
-                .db
-                .writer
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            let tx = db.transaction()?;
-            let mut hashes: Vec<String> = tx
+        let root = self.artifacts.clone();
+        self.on_writer(move |conn| {
+            let tx = conn.transaction()?;
+            let hashes = tx
                 .prepare("DELETE FROM artifacts WHERE expires_at_ms <= ?1 RETURNING blob_sha256")?
                 .query_map(params![now], |row| row.get(0))?
-                .collect::<Result<_, _>>()?;
-            hashes.sort();
-            hashes.dedup();
-            let mut unreferenced = Vec::new();
-            for hash in hashes {
-                if !artifact_referenced(&tx, &hash)? {
-                    unreferenced.push(hash);
-                }
-            }
+                .collect::<Result<Vec<String>, _>>()?;
             tx.commit()?;
-            unreferenced
-        };
-        // The artifact lock keeps a publish from referencing these bytes again meanwhile.
-        for hash in &unreferenced {
-            match fs::remove_file(blob_path(&self.artifacts, hash)) {
-                Err(e) if e.kind() != io::ErrorKind::NotFound => return Err(e.into()),
-                _ => {}
+            remove_unreferenced(conn, ARTIFACT_REFERENCED, &root, hashes)
+        })
+        .await
+    }
+
+    /// Whether the data directory's file system has at least `min_free_mb` MiB free.
+    pub async fn free_disk_ok(&self, min_free_mb: u64) -> Result<bool, StoreError> {
+        let dir = self.blobs.clone();
+        let free = blocking(move || Ok(fs2::available_space(dir)?)).await?;
+        Ok(free >= min_free_mb.saturating_mul(1024 * 1024))
+    }
+
+    /// One bounded retention pass: deletes captures older than [`CAPTURE_RETENTION`] (their
+    /// search rows cascade) with blobs no row still needs, then examines the next slice of blob
+    /// files for orphans. Returns the blob files removed.
+    pub async fn sweep(&self) -> Result<usize, StoreError> {
+        let retention_ms = i64::try_from(CAPTURE_RETENTION.as_millis()).unwrap_or(i64::MAX);
+        let cutoff = unix_ms(OffsetDateTime::now_utc())?.saturating_sub(retention_ms);
+        let mut removed = 0;
+        for _ in 0..SWEEP_BATCHES {
+            let root = self.blobs.clone();
+            let (deleted, freed) = self
+                .on_writer(move |conn| {
+                    let tx = conn.transaction()?;
+                    let hashes = tx
+                        .prepare(
+                            "DELETE FROM captures WHERE id IN (SELECT id FROM captures
+                             WHERE fetched_at_ms < ?1 LIMIT ?2) RETURNING blob_sha256",
+                        )?
+                        .query_map(params![cutoff, SWEEP_BATCH as i64], |row| row.get(0))?
+                        .collect::<Result<Vec<String>, _>>()?;
+                    tx.commit()?;
+                    let deleted = hashes.len();
+                    Ok((deleted, remove_unreferenced(conn, CAPTURE_REFERENCED, &root, hashes)?))
+                })
+                .await?;
+            removed += freed;
+            if deleted < SWEEP_BATCH {
+                break;
             }
         }
-        Ok(unreferenced.len())
+        for (index, root, referenced) in [
+            (0, &self.blobs, CAPTURE_REFERENCED),
+            (1, &self.artifacts, ARTIFACT_REFERENCED),
+        ] {
+            let cursor = self.orphan_cursors.lock().unwrap_or_else(PoisonError::into_inner)
+                [index]
+                .clone();
+            let dir = root.clone();
+            let (candidates, next) = blocking(move || Ok(orphan_candidates(&dir, &cursor)?)).await?;
+            self.orphan_cursors
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)[index] = next;
+            let root = root.clone();
+            removed += self
+                .on_writer(move |conn| remove_unreferenced(conn, referenced, &root, candidates))
+                .await?;
+        }
+        Ok(removed)
     }
 }
 
-fn artifact_referenced(conn: &Connection, hash: &str) -> Result<bool, StoreError> {
-    Ok(conn.query_row(
-        "SELECT EXISTS(SELECT 1 FROM artifacts WHERE blob_sha256 = ?1)",
-        params![hash],
-        |row| row.get(0),
-    )?)
+/// Runs blocking file or database work off the async runtime.
+async fn blocking<T: Send + 'static>(
+    f: impl FnOnce() -> Result<T, StoreError> + Send + 'static,
+) -> Result<T, StoreError> {
+    tokio::task::spawn_blocking(f)
+        .await
+        .map_err(|_| StoreError::Task)?
+}
+
+/// Decodes one `CAPTURE_COLUMNS` row; `None` when its blob is gone.
+fn read_capture(blobs: &Path, row: &rusqlite::Row<'_>) -> Result<Option<Capture>, StoreError> {
+    let hash: String = row.get(6)?;
+    let body = match fs::read(blob_path(blobs, &hash)) {
+        Ok(body) => body,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let route: Option<String> = row.get(8)?;
+    let tier: Option<String> = row.get(9)?;
+    let url = |index| -> Result<url::Url, StoreError> {
+        row.get::<_, String>(index)?
+            .parse()
+            .map_err(|_| StoreError::Corrupt)
+    };
+    Ok(Some(Capture {
+        id: row.get(0)?,
+        blob_sha256: hash,
+        tier: stored_tier(tier.as_deref())?,
+        fetched: Fetched {
+            // Rows written before the column existed were direct.
+            route: route
+                .as_deref()
+                .map_or(Some(Route::Direct), Route::parse)
+                .ok_or(StoreError::Corrupt)?,
+            requested_url: url(1)?,
+            final_url: url(2)?,
+            status: row.get(3)?,
+            headers: serde_json::from_str(&row.get::<_, String>(4)?)
+                .map_err(|_| StoreError::Corrupt)?,
+            content_type: row.get(5)?,
+            body: body.into(),
+            fetched_at: from_unix_ms(row.get(7)?)?,
+        },
+    }))
+}
+
+fn insert_capture(
+    tx: &Transaction<'_>,
+    key: &str,
+    fetched: &Fetched,
+    hash: &str,
+    tier: Tier,
+) -> Result<i64, StoreError> {
+    let headers: Vec<_> = fetched
+        .headers
+        .iter()
+        .filter(|(name, _)| {
+            !UNSTORED_HEADERS
+                .iter()
+                .any(|h| name.eq_ignore_ascii_case(h))
+        })
+        .collect();
+    let headers = serde_json::to_string(&headers).map_err(|_| StoreError::Corrupt)?;
+    tx.execute(
+        "INSERT INTO captures (cache_key, requested_url, final_url, status, headers,
+                               content_type, blob_sha256, byte_len, fetched_at_ms, route, tier)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            key,
+            fetched.requested_url.as_str(),
+            fetched.final_url.as_str(),
+            fetched.status,
+            headers,
+            fetched.content_type,
+            hash,
+            i64::try_from(fetched.body.len()).map_err(|_| StoreError::Corrupt)?,
+            unix_ms(fetched.fetched_at)?,
+            fetched.route.as_str(),
+            tier.as_str(),
+        ],
+    )?;
+    Ok(tx.last_insert_rowid())
+}
+
+/// Unlinks each blob in `root` that `referenced` (SQL taking the hash) finds no row for. Runs on
+/// the writer thread, so no insert of a referencing row interleaves.
+fn remove_unreferenced(
+    conn: &Connection,
+    referenced: &str,
+    root: &Path,
+    mut hashes: Vec<String>,
+) -> Result<usize, StoreError> {
+    hashes.sort();
+    hashes.dedup();
+    let mut stmt = conn.prepare_cached(referenced)?;
+    let mut removed = 0;
+    for hash in hashes {
+        if stmt.query_row([&hash], |row| row.get::<_, bool>(0))? {
+            continue;
+        }
+        match fs::remove_file(blob_path(root, &hash)) {
+            Ok(()) => removed += 1,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(removed)
+}
+
+/// Blob names after `cursor` in hash order, up to [`ORPHAN_SCAN`] examined, that are older than
+/// [`ORPHAN_GRACE`]; plus the next cursor, empty once the scan wraps.
+fn orphan_candidates(root: &Path, cursor: &str) -> io::Result<(Vec<String>, String)> {
+    let names = |dir: &Path, keep: &dyn Fn(&str) -> bool| -> io::Result<Vec<String>> {
+        let mut names: Vec<String> = fs::read_dir(dir)?
+            .filter_map(|entry| entry.ok()?.file_name().into_string().ok())
+            .filter(|name| keep(name))
+            .collect();
+        names.sort();
+        Ok(names)
+    };
+    let shard = cursor.get(..2).unwrap_or_default();
+    let is_hash = |name: &str| name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit());
+    let old = SystemTime::now()
+        .checked_sub(ORPHAN_GRACE)
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    let (mut candidates, mut examined, mut last) = (Vec::new(), 0, String::new());
+    for prefix in names(root, &|name| name.len() == 2 && name >= shard)? {
+        for name in names(&root.join(&prefix), &|name| is_hash(name) && name > cursor)? {
+            if examined == ORPHAN_SCAN {
+                return Ok((candidates, last));
+            }
+            examined += 1;
+            let modified = fs::metadata(blob_path(root, &name)).and_then(|meta| meta.modified());
+            if modified.is_ok_and(|at| at < old) {
+                candidates.push(name.clone());
+            }
+            last = name;
+        }
+    }
+    Ok((candidates, String::new()))
 }
 
 /// Rows written before the `tier` column existed are HTTP captures.
@@ -616,4 +770,9 @@ pub fn sha256_hex(bytes: &[u8]) -> String {
 
 fn unix_ms(at: OffsetDateTime) -> Result<i64, StoreError> {
     i64::try_from(at.unix_timestamp_nanos() / 1_000_000).map_err(|_| StoreError::Corrupt)
+}
+
+fn from_unix_ms(ms: i64) -> Result<OffsetDateTime, StoreError> {
+    OffsetDateTime::from_unix_timestamp_nanos(i128::from(ms) * 1_000_000)
+        .map_err(|_| StoreError::Corrupt)
 }

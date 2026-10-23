@@ -1,5 +1,20 @@
 # Decisions
 
+## 2026-10-23 — agent features and block recovery
+
+From the whole-system review's ranked gaps (Linear SNR-16), built: block recovery, change tracking,
+fit markdown with citation-style references, deterministic CSS-selector extraction, search time
+filters and a news source, adaptive per-host backoff, durable crawl webhooks, and active-crawl
+listing. Reviews and fixes followed (SNR-17, SNR-18).
+
+Block recovery reverses the earlier "never escalate on a block" stance, following the owner's
+direction to make the collector reach what a person can: a page that comes back blocked or
+401/403/429 is retried once through the SOCKS5 residential route, then once in the browser, as
+Firecrawl's `proxy: "auto"` does. Requests keep the declared user agent; nothing impersonates a
+browser identity, so the open question of presenting as a normal browser is unchanged. Recovery is
+on by default (`SONAR_BLOCK_RECOVERY`), honors `maxAge`, and records what ran in
+`metadata.recovery`. Webhooks always go direct, never through the paid route.
+
 ## 2026-10-22 — browser council: supervised Chrome, isolated contexts, short sessions
 
 Two blind designers proposed browser tiers; a fresh judge selected one and the root ratified it.

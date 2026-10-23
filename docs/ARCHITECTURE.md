@@ -173,23 +173,37 @@ DECISIONS.md. Each slice is a module with one owner; `api` gains routes, `scrape
   `maxDepth` 10, `includePaths`/`excludePaths` regexes, `allowBackwardLinks`/`crawlEntireDomain`,
   `allowExternalLinks`, `allowSubdomains`, `ignoreSitemap`, `ignoreQueryParameters`, `delay`,
   `scrapeOptions`; map `limit` 5000, `search`, `includeSubdomains`, `sitemapOnly`, `ignoreSitemap`).
-- `jobs` owns three tables in `sonar.db`: `jobs` (id, kind, request JSON, status
-  queued/scraping/completed/failed/cancelled, counters, created/updated/expires), `frontier`
-  (job, normalized URL unique per job, depth, state queued/leased/done/failed/skipped, lease owner,
-  lease generation, lease expiry, attempts), and `results` (job, URL, document JSON, error code).
-- Workers lease frontier rows in one transaction (`UPDATE … RETURNING`), bumping the generation;
-  completion commits only when the generation still matches. Expired leases return to `queued`, so a
-  restart or a stuck worker never loses or duplicates a result. Cancellation flips the job and stops
-  new leases; in-flight pages finish or time out.
-- Scheduling interleaves hosts: a worker pool (size from config) takes the oldest queued row whose
-  host is not at its per-host limit. The `net` per-host gate still applies.
+- One serving process owns `<data_dir>/sonar.lock` through an OS file lock. `jobs::db` owns SQL
+  for `jobs`, `frontier`, and `documents`, using `Store`'s writer transactions and pooled readers.
+  The frontier stores task kind, URL identity, depth, attempts, completion sequence, errors,
+  `capture_id`, and `blob_sha256`; documents are serialized domain values, not wire responses.
+- Leasing marks the oldest queued row for a host. A page's document, counters, and discovered
+  links commit together, only while both its lease and job remain active. Cancellation flips
+  queued and leased rows; late completions are discarded. Restart re-queues leases, failing rows
+  with three attempts as `SCRAPE_CRASH_LOOP`; no lease expiry, owner, or generation is needed.
+- A bounded worker pool (192 by default) and per-host minimum-time heap interleave hosts using
+  the same concurrency and spacing settings as `net`, plus crawl `delay`. The network gate stays
+  authoritative. Shutdown stops dispatch and drains workers within the configured request timeout.
 - Discovery: links from each rendered page plus `sitemap.xml` (and sitemap indexes, gzip) parsed
   with `quick-xml` and `flate2` under byte, entry, and depth caps. Every discovered URL is normalized
   (lowercase scheme and host, drop fragment and default port, optionally drop the query) and passes
   the scope rules before insertion; inserts are `INSERT OR IGNORE`, so duplicates cost nothing.
 - Map runs sitemap plus one page of links (no full crawl), filters by `search` substring, and caps.
-- Status pages results with `next` (offset cursor) and reports `completed`, `total`, `creditsUsed: 0`,
-  `expiresAt` (24 h retention, then a sweeper deletes job rows).
+- Status pages successful documents in stable completion order, up to 10 MiB (at least one
+  document), with `next`, `completed`, `total`, `creditsUsed: 0`, and `expiresAt`. `next` uses
+  `SONAR_PUBLIC_URL` when configured, otherwise the request Host header. Crawl errors have their
+  own endpoint. A ten-minute sweeper deletes expired terminal jobs with cascading documents;
+  retention defaults to 24 hours after completion. Raw captures remain independent of jobs.
+- Crawl headers are sent only to the seed host, removed from stored specifications at job end,
+  and never included in status or export records. Webhooks and full-URL regexes are rejected by
+  name; `maxConcurrency` and `deduplicateSimilarURLs` are accepted no-ops. Batch scrape options
+  are top-level. New jobs are refused at the active-job ceiling or below the free-disk floor
+  (`SONAR_MIN_FREE_DISK_MB`, default 2048; HTTP 507).
+- `sonar export [--since RFC3339] [--host SUFFIX] [--out PATH]` streams captures as JSON Lines,
+  using the shared capture renderer, filtering failed/blocked/unsupported/empty pages, and
+  deduplicating markdown hashes. Records include capture and blob IDs, source dates as stated,
+  route, and `tier: "http"`. Existing output files are never overwritten. The deduplication set
+  grows with unique exported documents; export does not read job specifications or headers.
 
 ### Browser tier (`browser`)
 

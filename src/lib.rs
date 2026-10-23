@@ -5,6 +5,8 @@ pub mod config;
 pub mod crawl;
 pub mod document;
 pub mod egress;
+pub mod export;
+pub mod jobs;
 pub mod net;
 pub mod page;
 pub mod scrape;
@@ -42,6 +44,13 @@ pub(crate) mod testkit {
             per_host_spacing_ms: 0,
             max_timeout_ms: 120_000,
             default_max_age_ms: 86_400_000,
+            job_workers: 192,
+            max_active_jobs: 100,
+            max_crawl_limit: 100_000,
+            job_retention_hours: 24,
+            map_timeout_ms: 60_000,
+            public_url: None,
+            min_free_disk_mb: 2048,
         };
         let loopback = "127.0.0.1".parse().unwrap();
         let private = "10.0.0.1".parse().unwrap();

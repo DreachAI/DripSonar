@@ -29,6 +29,8 @@ pub(super) enum Next {
 pub(super) struct Scheduler {
     jobs: HashMap<String, Job>,
     turns: VecDeque<String>,
+    /// Jobs whose queued rows are all backing off: when to wake each, and its delay.
+    later: HashMap<String, (Instant, u64)>,
     hosts: HashMap<String, Host>,
     concurrency: usize,
     spacing: Duration,
@@ -39,6 +41,7 @@ impl Scheduler {
         Self {
             jobs: HashMap::new(),
             turns: VecDeque::new(),
+            later: HashMap::new(),
             hosts: HashMap::new(),
             concurrency,
             spacing: Duration::from_millis(spacing_ms),
@@ -58,13 +61,19 @@ impl Scheduler {
         }
     }
 
-    pub fn refill(&mut self, id: &str, hosts: Vec<String>) {
+    /// With no ready host, the job sleeps until `later`, when its first backing-off row is due.
+    pub fn refill(&mut self, id: &str, hosts: Vec<String>, later: Option<Instant>) {
         if let Some(job) = self.jobs.get_mut(id) {
             if let Some(last) = hosts.last() {
                 job.cursor.clone_from(last);
                 job.hosts = hosts.into();
             } else {
                 self.turns.retain(|turn| turn != id);
+                if let Some(at) = later {
+                    let delay = job.delay.as_millis() as u64;
+                    let entry = self.later.entry(id.to_owned()).or_insert((at, delay));
+                    entry.0 = entry.0.min(at);
+                }
                 if job.inflight == 0 {
                     self.jobs.remove(id);
                 }
@@ -96,11 +105,23 @@ impl Scheduler {
                 };
                 Some(job.next_at.max(host_at))
             })
+            .chain(self.later.values().map(|(at, _)| *at))
             .min()
     }
 
     pub fn take(&mut self) -> Option<Next> {
         let now = Instant::now();
+        let due: Vec<String> = self
+            .later
+            .iter()
+            .filter(|(_, (at, _))| *at <= now)
+            .map(|(id, _)| id.clone())
+            .collect();
+        for id in due {
+            if let Some((_, delay)) = self.later.remove(&id) {
+                self.wake(id, delay);
+            }
+        }
         self.hosts
             .retain(|_, host| host.inflight != 0 || host.next > now);
         for _ in 0..self.turns.len() {

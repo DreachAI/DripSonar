@@ -36,7 +36,7 @@ use self::{
 };
 use crate::{
     config::Config,
-    egress::{ForwardProxy, RouteConfig},
+    egress::{ForwardProxy, Route, RouteConfig},
     net::{FetchError, Fetched, Fetcher},
     store::{self, Store, StoreError},
 };
@@ -208,12 +208,10 @@ impl BrowserTier {
         plan: &BrowserPlan,
     ) -> String {
         let user_agent = self.0.as_ref().map_or("", |tier| tier.user_agent.as_str());
-        let route = self.0.as_ref().map_or("direct", |tier| {
-            match tier.routes.route_for(url.host_str().unwrap_or_default()) {
-                crate::net::Route::Direct => "direct",
-                crate::net::Route::Proxy => "proxy",
-            }
+        let route = self.0.as_ref().map_or(Route::Direct, |tier| {
+            tier.routes.route_for(url.host_str().unwrap_or_default())
         });
+        let route = route.as_str();
         let assets = if plan.is_visual() { "visual" } else { "text" };
         let (width, height) = pool::VIEWPORT;
         let mut material = format!(

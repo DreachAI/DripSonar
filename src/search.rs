@@ -5,6 +5,7 @@ use std::{collections::HashSet, future::Future, sync::Arc, time::Duration};
 use crate::{
     config::Config,
     net::{FetchError, Fetched, Fetcher, Target},
+    store::{Store, sha256_hex},
 };
 use dom_query::Document;
 use tokio::time::{Instant, timeout_at};
@@ -15,7 +16,7 @@ const MAX_RESPONSE_BYTES: usize = 2 * 1024 * 1024;
 /// Same-origin redirects followed for the operator's own SearXNG.
 const TRUSTED_MAX_REDIRECTS: usize = 3;
 
-#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct Hit {
     pub url: String,
     pub title: String,
@@ -211,6 +212,8 @@ pub struct Searcher {
     fetcher: Fetcher,
     /// The operator's SearXNG and the unguarded client that reaches it.
     searxng: Option<(Url, Arc<reqwest::Client>)>,
+    /// Where each provider exchange is recorded, when set.
+    store: Option<Store>,
 }
 
 impl Searcher {
@@ -224,7 +227,17 @@ impl Searcher {
                 }
             }
         });
-        Self { fetcher, searxng }
+        Self {
+            fetcher,
+            searxng,
+            store: None,
+        }
+    }
+
+    /// Records every provider exchange as a capture plus a `searches` row.
+    pub fn with_store(mut self, store: Store) -> Self {
+        self.store = Some(store);
+        self
     }
 
     pub async fn search(
@@ -235,7 +248,8 @@ impl Searcher {
         deadline: Instant,
     ) -> Result<Vec<Hit>, SearchError> {
         let searxng = self.searxng.as_ref();
-        run_chain(
+        let mut exchanges = Vec::new();
+        let result = run_chain(
             searxng.map(|(endpoint, _)| endpoint),
             query,
             limit,
@@ -249,8 +263,25 @@ impl Searcher {
                     _ => self.fetcher.fetch(&target).await,
                 }
             },
+            |provider, fetched, hits| {
+                if self.store.is_some() {
+                    exchanges.push((provider, fetched.clone(), hits.map(<[Hit]>::to_vec)));
+                }
+            },
         )
-        .await
+        .await;
+        if let Some(store) = &self.store {
+            for (provider, fetched, hits) in exchanges {
+                let key = sha256_hex(format!("search\n{provider}\n{lang}\n{query}").as_bytes());
+                let stored = store
+                    .put_search(&key, &fetched, query, provider, lang, hits.as_deref())
+                    .await;
+                if let Err(error) = stored {
+                    tracing::warn!(%error, provider, "search exchange not stored");
+                }
+            }
+        }
+        result
     }
 }
 
@@ -329,6 +360,15 @@ enum Provider<'a> {
 }
 
 impl Provider<'_> {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Searxng(_) => "searxng",
+            Self::DuckDuckGo => "duckduckgo",
+            Self::Mojeek => "mojeek",
+            Self::Brave => "brave",
+        }
+    }
+
     /// Result pages requested: only SearXNG pages through its JSON.
     fn pages(self) -> u32 {
         if matches!(self, Self::Searxng(_)) {
@@ -388,6 +428,8 @@ async fn run_chain<F, Fut>(
     lang: &str,
     deadline: Instant,
     mut fetch: F,
+    // Each provider response: its name, the response, and its hits when it parsed.
+    mut record: impl FnMut(&'static str, &Fetched, Option<&[Hit]>),
 ) -> Result<Vec<Hit>, SearchError>
 where
     F: FnMut(Target) -> Fut,
@@ -399,12 +441,12 @@ where
     if limit == 0 {
         return Ok(Vec::new());
     }
-    let providers = searxng.map(Provider::Searxng).into_iter().chain([
-        Provider::DuckDuckGo,
-        Provider::Mojeek,
-        Provider::Brave,
-    ]);
-    let mut providers_left = if searxng.is_some() { 4 } else { 3 };
+    let providers: Vec<_> = searxng
+        .map(Provider::Searxng)
+        .into_iter()
+        .chain([Provider::DuckDuckGo, Provider::Mojeek, Provider::Brave])
+        .collect();
+    let mut providers_left = providers.len() as u32;
     for provider in providers {
         let now = Instant::now();
         let provider_deadline = now
@@ -424,12 +466,19 @@ where
                 deadline: provider_deadline,
                 max_bytes: MAX_RESPONSE_BYTES,
             };
-            let response = timeout_at(provider_deadline, fetch(target)).await;
-            let fetched = match response {
-                Ok(Ok(fetched)) if (200..300).contains(&fetched.status) => fetched,
-                _ => break,
+            let Ok(Ok(fetched)) = timeout_at(provider_deadline, fetch(target)).await else {
+                break;
             };
-            let Ok((page_hits, has_results)) = provider.parse(&fetched) else {
+            let parsed = (200..300)
+                .contains(&fetched.status)
+                .then(|| provider.parse(&fetched).ok())
+                .flatten();
+            record(
+                provider.name(),
+                &fetched,
+                parsed.as_ref().map(|(hits, _)| hits.as_slice()),
+            );
+            let Some((page_hits, has_results)) = parsed else {
                 break;
             };
             hits.extend(page_hits.into_iter().filter(|hit| {
@@ -526,6 +575,7 @@ mod tests {
                     };
                     ready(result)
                 },
+                |_, _, _| {},
             )
             .await;
             assert_eq!(calls, expected_calls);
@@ -571,6 +621,7 @@ mod tests {
                     };
                     ready(Ok(response(target, 200, &body)))
                 },
+                |_, _, _| {},
             )
             .await?;
             assert_eq!(calls, expected_calls);
@@ -587,11 +638,19 @@ mod tests {
             (10, Instant::now(), true),
             (0, Instant::now() + Duration::from_secs(5), false),
         ] {
-            let result = run_chain(None, "test", limit, "en", deadline, |_| {
-                panic!("no fetch should start");
-                #[allow(unreachable_code)]
-                ready(Err(FetchError::Connect))
-            })
+            let result = run_chain(
+                None,
+                "test",
+                limit,
+                "en",
+                deadline,
+                |_| {
+                    panic!("no fetch should start");
+                    #[allow(unreachable_code)]
+                    ready(Err(FetchError::Connect))
+                },
+                |_, _, _| {},
+            )
             .await;
             if timeout {
                 assert!(matches!(result, Err(SearchError::Timeout)));
@@ -606,6 +665,7 @@ mod tests {
             "en",
             Instant::now() + Duration::from_millis(5),
             |_| std::future::pending::<Result<Fetched, FetchError>>(),
+            |_, _, _| {},
         )
         .await;
         assert!(matches!(result, Err(SearchError::Timeout)));

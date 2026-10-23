@@ -22,15 +22,20 @@ use tokio::{
 use url::Url;
 
 use crate::{
+    browser::BrowserError,
     config::Config,
     crawl::{
         self, Scope,
         sitemap::{self, SitemapEntries},
     },
-    net::{Fetcher, Target},
-    scrape::{Document, ScrapeTemplate, Scraper},
+    document::DocumentError,
+    net::{FetchError, Fetcher, Target},
+    scrape::{Document, ScrapeError, ScrapeTemplate, Scraper},
     store::{Store, StoreError, sha256_hex},
 };
+
+/// How often the store's bounded retention and orphan-blob sweep runs.
+const STORE_SWEEP_EVERY: Duration = Duration::from_secs(3600);
 
 pub type JobId = uuid::Uuid;
 
@@ -129,6 +134,8 @@ pub(super) struct Work {
     task: Task,
     url: Url,
     depth: u32,
+    /// Leases so far, including this one.
+    attempts: u32,
     spec: JobSpec,
 }
 
@@ -139,6 +146,8 @@ pub(super) struct Outcome {
     capture_id: Option<i64>,
     blob_sha256: Option<String>,
     error: Option<String>,
+    /// A transient failure: requeue after a backoff while attempts remain.
+    retry: bool,
 }
 
 impl Jobs {
@@ -175,6 +184,7 @@ impl Jobs {
             wake,
         };
         let dispatcher = tokio::spawn(this.clone().dispatch(receive, active));
+        tokio::spawn(sweep_store(Arc::downgrade(&this.inner)));
         Ok((this, dispatcher))
     }
 
@@ -197,7 +207,12 @@ impl Jobs {
         }
         crate::scrape::request_headers(&spec.scrape.headers)
             .map_err(|error| JobError::Invalid(error.to_string()))?;
-        if !self.has_disk_space().await? {
+        if !self
+            .inner
+            .store
+            .free_disk_ok(self.inner.cfg.min_free_disk_mb)
+            .await?
+        {
             return Err(JobError::InsufficientStorage);
         }
         let id = JobId::new_v4();
@@ -247,14 +262,6 @@ impl Jobs {
         self.inner.stop.notify_one();
     }
 
-    async fn has_disk_space(&self) -> Result<bool, StoreError> {
-        let dir = self.inner.cfg.data_dir.clone();
-        let free = tokio::task::spawn_blocking(move || fs2::available_space(dir))
-            .await
-            .map_err(|_| StoreError::Task)??;
-        Ok(free >= self.inner.cfg.min_free_disk_mb.saturating_mul(1024 * 1024))
-    }
-
     async fn dispatch(
         self,
         mut receive: mpsc::Receiver<Vec<(String, u64)>>,
@@ -302,7 +309,13 @@ impl Jobs {
                 match next {
                     sched::Next::Refill { job, after } => {
                         match db::hosts(&self.inner.store, job.clone(), after).await {
-                            Ok(hosts) => scheduler.refill(&job, hosts),
+                            Ok((hosts, later)) => {
+                                let later = later.map(|at| {
+                                    let wait = u64::try_from(at.saturating_sub(now_ms()));
+                                    Instant::now() + Duration::from_millis(wait.unwrap_or(0))
+                                });
+                                scheduler.refill(&job, hosts, later)
+                            }
                             Err(error) => {
                                 tracing::error!(%error, "job host refill failed; retrying");
                                 paused_until = retry_at(&mut backoff);
@@ -310,7 +323,11 @@ impl Jobs {
                         }
                     }
                     sched::Next::Lease { job, host } => {
-                        let disk = self.has_disk_space().await;
+                        let disk = self
+                            .inner
+                            .store
+                            .free_disk_ok(self.inner.cfg.min_free_disk_mb)
+                            .await;
                         if !matches!(disk, Ok(true)) {
                             scheduler.release(&job, &host);
                             match disk {
@@ -422,6 +439,7 @@ impl Jobs {
             capture_id: None,
             blob_sha256: None,
             error: None,
+            retry: false,
         };
         let mut request = work.spec.scrape.request(&work.url);
         if work.spec.kind == JobKind::Crawl
@@ -458,9 +476,20 @@ impl Jobs {
                             .map(|markdown| sha256_hex(markdown.as_bytes()));
                         out.capture_id = doc.capture_id;
                         out.blob_sha256 = doc.blob_sha256.clone();
+                        out.retry = transient_status(doc.status);
                         out.doc = Some(doc);
                     }
-                    Err(error) => out.error = Some(error.code().into()),
+                    Err(error) => {
+                        out.retry = match &error {
+                            ScrapeError::Fetch(error)
+                            | ScrapeError::Browser(BrowserError::Fetch(error)) => {
+                                transient_fetch(error)
+                            }
+                            ScrapeError::Pdf(DocumentError::Timeout) => true,
+                            _ => false,
+                        };
+                        out.error = Some(error.code().into())
+                    }
                 }
             }
             Task::Robots | Task::Sitemap => {
@@ -496,6 +525,7 @@ impl Jobs {
                         }
                         out.blob_sha256 = Some(sha256_hex(&fetched.body));
                         if !(200..300).contains(&fetched.status) {
+                            out.retry = transient_status(fetched.status);
                             out.error = Some("SCRAPE_SITE_ERROR".into());
                         } else if work.task == Task::Robots {
                             out.links = sitemap::robots_sitemaps(&fetched.text())
@@ -533,7 +563,8 @@ impl Jobs {
                         }
                     }
                     Err(error) => {
-                        out.error = Some(crate::scrape::ScrapeError::from(error).code().into())
+                        out.retry = transient_fetch(&error);
+                        out.error = Some(ScrapeError::from(error).code().into())
                     }
                 }
             }
@@ -545,6 +576,36 @@ impl Jobs {
             self.inner.cfg.job_retention_hours,
         )
         .await
+    }
+}
+
+/// Timeouts, refused or reset connections, and a full fetch queue may pass on a later attempt.
+fn transient_fetch(error: &FetchError) -> bool {
+    matches!(
+        error,
+        FetchError::Timeout | FetchError::Connect | FetchError::Overloaded
+    )
+}
+
+/// Rate limiting and temporary unavailability.
+fn transient_status(status: u16) -> bool {
+    matches!(status, 429 | 503)
+}
+
+/// Runs the store's retention sweep hourly until the jobs stop.
+async fn sweep_store(inner: std::sync::Weak<Inner>) {
+    let mut every = tokio::time::interval(STORE_SWEEP_EVERY);
+    loop {
+        every.tick().await;
+        let Some(inner) = inner.upgrade() else { return };
+        if inner.stopped.load(Ordering::Acquire) {
+            return;
+        }
+        match inner.store.sweep().await {
+            Ok(0) => {}
+            Ok(removed) => tracing::info!(removed, "retention removed blob files"),
+            Err(error) => tracing::warn!(%error, "store retention sweep failed"),
+        }
     }
 }
 

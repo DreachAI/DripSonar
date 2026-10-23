@@ -14,15 +14,24 @@ CREATE TABLE IF NOT EXISTS frontier (
  task TEXT NOT NULL, url TEXT NOT NULL, key TEXT NOT NULL, host TEXT NOT NULL,
  depth INTEGER NOT NULL, state TEXT NOT NULL, attempts INTEGER NOT NULL DEFAULT 0,
  seq INTEGER, content_sha TEXT, capture_id INTEGER, blob_sha256 TEXT,
- error_code TEXT, finished_ms INTEGER, UNIQUE(job_id, task, key));
+ error_code TEXT, finished_ms INTEGER, not_before_ms INTEGER NOT NULL DEFAULT 0,
+ UNIQUE(job_id, task, key));
 DROP INDEX IF EXISTS frontier_ready;
+DROP INDEX IF EXISTS frontier_job_hosts;
 CREATE INDEX IF NOT EXISTS frontier_job ON frontier(job_id, seq);
 CREATE INDEX IF NOT EXISTS frontier_dup ON frontier(job_id, content_sha);
 CREATE INDEX IF NOT EXISTS frontier_open ON frontier(job_id) WHERE state IN ('queued','leased');
-CREATE INDEX IF NOT EXISTS frontier_job_hosts ON frontier(job_id, host, id) WHERE state='queued';
 CREATE TABLE IF NOT EXISTS documents (
  frontier_id INTEGER PRIMARY KEY REFERENCES frontier(id) ON DELETE CASCADE, doc TEXT NOT NULL);
 ";
+/// Needs `not_before_ms`, which older stores gain by ALTER first. Covering for host refill and
+/// lease: both walk hosts or IDs in order and skip rows still backing off.
+const QUEUED_INDEX: &str =
+    "CREATE INDEX IF NOT EXISTS frontier_queued ON frontier(job_id, host, id, not_before_ms)
+     WHERE state='queued'";
+
+/// Pauses before the second and third attempt after a transient failure; then it fails.
+const RETRY_BACKOFF_MS: [i64; 2] = [5_000, 30_000];
 
 fn encode<T: Serialize>(value: &T) -> Result<String, StoreError> {
     serde_json::to_string(value).map_err(|_| StoreError::Corrupt)
@@ -44,6 +53,17 @@ pub async fn initialize(store: &Store, retention: u64) -> Result<(), StoreError>
     store
         .write(move |tx| {
             tx.execute_batch(SCHEMA)?;
+            let has_not_before: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pragma_table_info('frontier') WHERE name='not_before_ms')",
+                [],
+                |row| row.get(0),
+            )?;
+            if !has_not_before {
+                tx.execute_batch(
+                    "ALTER TABLE frontier ADD COLUMN not_before_ms INTEGER NOT NULL DEFAULT 0",
+                )?;
+            }
+            tx.execute_batch(QUEUED_INDEX)?;
             let now = now_ms();
             tx.execute(
                 "DELETE FROM jobs WHERE expires_ms <= ?1 AND status!='scraping'",
@@ -91,25 +111,41 @@ pub async fn active(store: &Store) -> Result<Vec<(String, u64)>, StoreError> {
         .await
 }
 
-pub async fn hosts(store: &Store, job: String, after: String) -> Result<Vec<String>, StoreError> {
+/// The next page of hosts with a ready row; when none is ready, the earliest time one will be.
+pub async fn hosts(
+    store: &Store,
+    job: String,
+    after: String,
+) -> Result<(Vec<String>, Option<i64>), StoreError> {
     store
         .read(move |conn| {
+            let now = now_ms();
             let mut stmt = conn.prepare(
-            "SELECT DISTINCT host FROM frontier INDEXED BY frontier_job_hosts WHERE job_id=?1 AND state='queued'
-             AND host>?2 AND EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND status='scraping')
+            "SELECT DISTINCT host FROM frontier INDEXED BY frontier_queued WHERE job_id=?1 AND state='queued'
+             AND host>?2 AND not_before_ms<=?4 AND EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND status='scraping')
              ORDER BY host LIMIT ?3",
             )?;
             let mut page = |after: &str| -> Result<Vec<String>, StoreError> {
                 Ok(stmt
-                    .query_map(params![job, after, sched::HOST_PAGE as i64], |r| r.get(0))?
+                    .query_map(params![job, after, sched::HOST_PAGE as i64, now], |r| r.get(0))?
                     .collect::<Result<Vec<_>, _>>()?)
             };
-            let hosts = page(&after)?;
+            let mut hosts = page(&after)?;
             if hosts.is_empty() && !after.is_empty() {
-                page("")
-            } else {
-                Ok(hosts)
+                hosts = page("")?;
             }
+            if !hosts.is_empty() {
+                return Ok((hosts, None));
+            }
+            // Only rows backing off remain queued, so this scan stays small.
+            let later = conn.query_row(
+                "SELECT MIN(not_before_ms) FROM frontier INDEXED BY frontier_queued
+                 WHERE job_id=?1 AND state='queued'
+                 AND EXISTS(SELECT 1 FROM jobs WHERE id=?1 AND status='scraping')",
+                [&job],
+                |r| r.get(0),
+            )?;
+            Ok((hosts, later))
         })
         .await
 }
@@ -206,9 +242,10 @@ pub async fn lease(store: &Store, job: String, host: String) -> Result<Option<Wo
                 .query_row(
                     "UPDATE frontier SET state='leased',attempts=attempts+1 WHERE id=(
              SELECT f.id FROM frontier f JOIN jobs j ON j.id=f.job_id
-              WHERE f.state='queued' AND f.host=?1 AND f.job_id=?2 AND j.status='scraping' ORDER BY f.id LIMIT 1)
-             RETURNING id,job_id,task,url,depth",
-                    params![host, job],
+              WHERE f.state='queued' AND f.host=?1 AND f.job_id=?2 AND f.not_before_ms<=?3
+              AND j.status='scraping' ORDER BY f.id LIMIT 1)
+             RETURNING id,job_id,task,url,depth,attempts",
+                    params![host, job, now_ms()],
                     |row| {
                         Ok((
                             row.get::<_, i64>(0)?,
@@ -216,11 +253,12 @@ pub async fn lease(store: &Store, job: String, host: String) -> Result<Option<Wo
                             row.get::<_, String>(2)?,
                             row.get::<_, String>(3)?,
                             row.get::<_, u32>(4)?,
+                            row.get::<_, u32>(5)?,
                         ))
                     },
                 )
                 .optional()?;
-            let Some((id, job_id, task, url, depth)) = row else {
+            let Some((id, job_id, task, url, depth, attempts)) = row else {
                 return Ok(None);
             };
             let spec: String =
@@ -237,6 +275,7 @@ pub async fn lease(store: &Store, job: String, host: String) -> Result<Option<Wo
                 id,
                 job_id,
                 depth,
+                attempts,
                 task,
                 url: url.parse().map_err(|_| StoreError::Corrupt)?,
                 spec: decode(&spec)?,
@@ -263,8 +302,20 @@ pub async fn complete(
     retention: u64,
 ) -> Result<(), StoreError> {
     let doc = out.doc.map(|doc| encode(&doc)).transpose()?;
+    let backoff = (work.attempts as usize)
+        .checked_sub(1)
+        .and_then(|index| RETRY_BACKOFF_MS.get(index).copied())
+        .filter(|_| out.retry);
     store.write(move |tx| {
         let now = now_ms();
+        if let Some(backoff) = backoff {
+            tx.execute(
+                "UPDATE frontier SET state='queued',not_before_ms=?2 WHERE id=?1 AND state='leased'
+                 AND EXISTS(SELECT 1 FROM jobs WHERE id=frontier.job_id AND status='scraping')",
+                params![work.id, now.saturating_add(backoff)],
+            )?;
+            return Ok(());
+        }
         // Both checks are essential: a cancelled job must not accept an in-flight document.
         let changed = tx.execute(
             "UPDATE frontier SET state=?2,content_sha=?3,capture_id=?4,blob_sha256=?5,

@@ -1,5 +1,49 @@
 # Decisions
 
+## 2026-10-22 — browser council: supervised Chrome, isolated contexts, short sessions
+
+Two blind designers proposed browser tiers; a fresh judge selected one and the root ratified it.
+Selected: one supervised Chrome with a fresh isolated context per request (4 by default), plain
+HTTP first with escalation only for script shells (fewer than 200 visible characters plus a concrete
+shell marker; never on challenges or 401/403/429), a separate cache namespace for rendered pages,
+no cache reads or shared execution for requests with actions, waits, or screenshots, no automatic
+replay of actions, capture metadata recording the browser tier, and Firecrawl-compatible actions
+(`wait`, `click`, `write`, `press`, `scroll`, `screenshot`, `scrape`, `executeJavascript`).
+
+- Screenshots are served as expiring capability URLs under `SONAR_PUBLIC_URL` (as Firecrawl does),
+  stored through the blob writer with a quota; the capability ID is never logged.
+- Graft: short multi-step sessions (`POST /v1/browser`, `POST /v1/browser/:id`, `DELETE`), so an
+  agent can look at a page before deciding what to click or type. Temporary state only; a Chrome
+  restart invalidates them; bounded so they cannot take every tab.
+- Confinement (root decision): on EC2, Chrome runs as its own systemd service whose per-unit IP
+  filter allows only loopback, and `sonar` connects to it over the DevTools WebSocket
+  (`SONAR_CHROME_WS`). Its only route out is the guarded forward proxy. Locally, `SONAR_CHROME_PATH`
+  launches a child Chrome instead, without that guarantee.
+- Rejected: shared execution for identical action requests, data-URL screenshots, silent no-op
+  `waitFor` when the browser is off, and no memory ceiling.
+- Reverses if measured demand makes four tabs the bottleneck: several supervised Chrome processes
+  or a remote browser fleet behind the same interface.
+
+## 2026-10-22 — crawl council: single-owner SQLite frontier
+
+Two blind designers proposed crawl/map/batch designs; a fresh judge selected one and the root
+ratified it. Selected: one `sonar` process owns `data_dir` (OS file lock); a SQLite frontier
+(`jobs`, `frontier`, `documents`) with an in-memory per-host min-heap scheduler; each page's
+document, counters, and discovered links commit in one transaction; restart re-queues leased rows
+and fails rows after three crash attempts; status pages in completion order (`seq`); `sonar export`
+streams the capture history as JSON Lines for fine-tuning. This drops the lease owner, expiry, and
+generation fencing from the earlier plan: with a single owner they guard nothing.
+
+- Graft: every frontier row records `capture_id` and `blob_sha256`, so each job result and export
+  record points at its raw capture.
+- Fixes required: cancel also stops in-flight completions; crawl headers are scoped to the seed
+  host, cleared at job end, never exported; the gate takes the global slot before booking per-host
+  spacing; `SONAR_PUBLIC_URL` for status `next` links; export records route and capture tier; a
+  free-disk floor rejects new jobs.
+- Rejected: lease fencing plus a single-owner lock (redundant), document blobs outside the
+  transaction (orphans), a 32-request global default (contradicts 256).
+- Reverses if more than one process or machine must share a queue: lease fencing, then Postgres.
+
 ## 2026-10-22 — build-out policy: all Rust, no tests or CI, push to main
 
 The owner wants DripSonar fully in Rust, deployed as one binary on an EC2 host and run at high

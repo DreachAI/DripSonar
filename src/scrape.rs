@@ -134,7 +134,7 @@ impl Scraper {
 }
 
 /// Missing scheme gets `http://`, as Firecrawl does; the fragment never reaches the server.
-fn normalize(input: &str) -> Result<Url, ScrapeError> {
+pub fn normalize(input: &str) -> Result<Url, ScrapeError> {
     let input = input.trim();
     let mut url = match Url::parse(input) {
         Ok(url) if url.has_host() => url,

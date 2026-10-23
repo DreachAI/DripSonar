@@ -2,6 +2,7 @@
 
 pub mod api;
 pub mod config;
+pub mod crawl;
 pub mod document;
 pub mod net;
 pub mod page;

@@ -660,9 +660,12 @@ dependencies = [
  "clap",
  "dom_query",
  "encoding_rs",
+ "flate2",
  "futures",
  "htmd",
  "pdf_oxide",
+ "quick-xml 0.38.4",
+ "regex",
  "reqwest",
  "rusqlite",
  "serde",
@@ -1628,7 +1631,7 @@ dependencies = [
  "fast-float2",
  "flate2",
  "log",
- "quick-xml",
+ "quick-xml 0.42.0",
  "serde",
  "serde_json",
  "thiserror",
@@ -1697,7 +1700,7 @@ dependencies = [
  "nom",
  "office_oxide",
  "phf 0.14.0",
- "quick-xml",
+ "quick-xml 0.42.0",
  "regex",
  "serde",
  "serde_json",
@@ -1907,6 +1910,15 @@ name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a993555f31e5a609f617c12db6250dedcac1b0a85076912c436e6fc9b2c8e6a3"
+
+[[package]]
+name = "quick-xml"
+version = "0.38.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b66c2058c55a409d601666cffe35f04333cf1013010882cec174a7467cd4e21c"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "quick-xml"

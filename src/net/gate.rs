@@ -45,9 +45,12 @@ impl Gate {
         }
     }
 
-    /// Waits for a host slot and its spacing, then a global slot; all waiting counts against
-    /// `deadline`. Host slots come first so a slow host cannot pin global slots while queued.
+    /// Takes global capacity before booking host spacing, so global contention cannot bunch starts.
     pub(super) async fn enter(&self, host: &str, deadline: Instant) -> Result<Pass, FetchError> {
+        let global = timeout_at(deadline, Arc::clone(&self.global).acquire_owned())
+            .await
+            .map_err(|_| FetchError::Overloaded)?
+            .map_err(|_| FetchError::Protocol)?;
         let slot = self.slot(host);
         let host_permit = timeout_at(deadline, Arc::clone(&slot.permits).acquire_owned())
             .await
@@ -59,17 +62,13 @@ impl Gate {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             let start = (*next).max(Instant::now());
+            if start > deadline {
+                return Err(FetchError::Timeout);
+            }
             *next = start + self.spacing;
             start
         };
-        if start > deadline {
-            return Err(FetchError::Timeout);
-        }
         sleep_until(start).await;
-        let global = timeout_at(deadline, Arc::clone(&self.global).acquire_owned())
-            .await
-            .map_err(|_| FetchError::Overloaded)?
-            .map_err(|_| FetchError::Protocol)?;
         Ok(Pass {
             _host: host_permit,
             _global: global,

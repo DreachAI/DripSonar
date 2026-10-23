@@ -181,6 +181,7 @@ async fn scrape(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
         .url
         .as_deref()
         .ok_or_else(|| ApiError::bad_request("url is required"))?;
+    state.ensure_storage().await?;
     let data = scrape_document(&state, &opts, shot, url, None).await?;
     Ok(Json(json!({"success": true, "data": data})))
 }
@@ -372,6 +373,9 @@ async fn search(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
     // Validate the scrape plan before issuing the search, even if no hits are returned.
     let (_, formats) = state.plan(&opts, &[])?;
     let _ = browser_plan(&opts, &formats)?;
+    if !formats.is_empty() {
+        state.ensure_storage().await?;
+    }
     let timeout = body
         .get("timeout")
         .cloned()

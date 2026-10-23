@@ -34,6 +34,8 @@ enum Command {
     Search { query: String },
     /// Export successful capture history as JSON Lines (never overwrites an existing file).
     Export {
+        #[arg(long, value_enum, default_value_t)]
+        kind: dripsonar::export::ExportKind,
         #[arg(long)]
         since: Option<String>,
         #[arg(long)]
@@ -144,14 +146,22 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         }
         Command::Search { query } => {
             let deadline = Instant::now() + Duration::from_secs(60);
+            let store = Store::open(&cfg.data_dir)?;
             let hits = Searcher::new(Fetcher::new(&cfg)?, &cfg)
+                .with_store(store)
                 .search(&query, 5, "en", deadline)
                 .await?;
             println!("{}", serde_json::to_string_pretty(&hits)?);
         }
-        Command::Export { since, host, out } => {
-            dripsonar::export::export(
+        Command::Export {
+            kind,
+            since,
+            host,
+            out,
+        } => {
+            dripsonar::export::export_kind(
                 &Store::open(&cfg.data_dir)?,
+                kind,
                 since.as_deref(),
                 host.as_deref(),
                 out.as_deref(),

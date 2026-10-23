@@ -96,6 +96,11 @@ endpoint (see Structured extraction below).
    with a known challenge title) is `Blocked`; other 4xx/5xx pages render normally and report their
    `statusCode`, as Firecrawl does.
 
+Rendering runs off the async runtime on blocking threads, bounded by `SONAR_RENDER_THREADS`
+(also used for browser session views); the deadline still applies while waiting for a slot.
+Interactive scrapes (v1/v2 scrape, context scrape, search with scrape) return 507
+`SCRAPE_STORAGE_FULL` below the free-disk floor (`SONAR_MIN_FREE_DISK_MB`), checked once per request.
+
 Error mapping (Firecrawl v1 body `{success:false, code, error}`):
 
 | Failure | Code | HTTP |
@@ -132,7 +137,10 @@ for blocks, otherwise the Firecrawl code) with `error`.
   requested URL, final URL, status, selected headers, content type, blob hash, byte length,
   fetched_at. `<data_dir>/blobs/sha256/<ab>/<hash>` holds raw bodies.
 - The database is the cache index and the audit log. Captures are appended, never updated.
-- A size-bounded sweeper may delete captures older than a retention window and unreferenced blobs.
+- Capture retention is 30 days: an hourly sweep deletes older captures (their `searches` rows
+  cascade) and blobs nothing references.
+- A `searches` table records each stored search (query, provider, language, time, hits) against
+  its capture row (`capture_id`, cascading delete); `sonar export --kind search` emits it.
 
 ## API (`api`)
 
@@ -200,8 +208,10 @@ DECISIONS.md. Each slice is a module with one owner; `api` gains routes, `scrape
   and never included in status or export records. Webhooks and full-URL regexes are rejected by
   name; `maxConcurrency` and `deduplicateSimilarURLs` are accepted no-ops. Batch scrape options
   are top-level. New jobs are refused at the active-job ceiling or below the free-disk floor
-  (`SONAR_MIN_FREE_DISK_MB`, default 2048; HTTP 507).
-- `sonar export [--since RFC3339] [--host SUFFIX] [--out PATH]` streams captures as JSON Lines,
+  (`SONAR_MIN_FREE_DISK_MB`, default 2048; HTTP 507). Transient job-page failures are retried
+  after 5 s and 30 s (3 attempts in all).
+- `sonar export [--kind pages|search|all] [--since RFC3339] [--host SUFFIX] [--out PATH]` (default
+  `pages`; `all` emits pages then searches) streams captures as JSON Lines,
   using the shared capture renderer, filtering failed/blocked/unsupported/empty pages, and
   deduplicating markdown hashes. Records include capture and blob IDs, source dates as stated,
   route, and `tier: "http"`. Existing output files are never overwritten. The deduplication set

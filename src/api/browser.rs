@@ -47,7 +47,7 @@ pub(super) async fn open(
     let url = scrape::normalize(&body.url)?;
     let plan = plan(Vec::new(), &body.formats)?;
     let (id, output) = state.browser.open_session(&url, deadline, &plan).await?;
-    let mut reply = view(&output);
+    let mut reply = view(&output, deadline).await?;
     reply.insert("id".into(), json!(id));
     Ok(Json(Value::Object(reply)))
 }
@@ -61,7 +61,7 @@ pub(super) async fn step(
     let deadline = Instant::now() + state.timeout(body.timeout, SCRAPE_TIMEOUT_MS)?;
     let plan = plan(body.actions, &body.formats)?;
     let output = state.browser.session_step(&id, &plan, deadline).await?;
-    let mut reply = view(&output);
+    let mut reply = view(&output, deadline).await?;
     let actions = output.extras.actions.unwrap_or_default();
     reply.insert("actions".into(), json!(actions));
     Ok(Json(Value::Object(reply)))
@@ -101,14 +101,16 @@ fn plan(actions: Vec<Action>, formats: &[Format]) -> Result<BrowserPlan, ApiErro
 
 /// The page as it stands: the whole page as markdown, navigation included, so an agent can
 /// see what to click or type next.
-fn view(output: &BrowserOutput) -> Map<String, Value> {
+async fn view(output: &BrowserOutput, deadline: Instant) -> Result<Map<String, Value>, ApiError> {
     let capture = &output.capture;
     let options = RenderOptions {
         markdown: true,
         remove_base64_images: true,
         ..RenderOptions::default()
     };
-    let rendered = page::render(&capture.text(), &capture.final_url, &options);
+    let (text, url) = (capture.text(), capture.final_url.clone());
+    let rendered =
+        scrape::render_blocking(deadline, move || Ok(page::render(&text, &url, &options))).await?;
     let mut view = Map::new();
     view.insert("success".into(), json!(true));
     view.insert("url".into(), json!(capture.final_url.as_str()));
@@ -119,5 +121,5 @@ fn view(output: &BrowserOutput) -> Map<String, Value> {
     if let Some(screenshot) = &output.extras.screenshot {
         view.insert("screenshot".into(), json!(screenshot));
     }
-    view
+    Ok(view)
 }

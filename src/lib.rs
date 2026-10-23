@@ -42,6 +42,7 @@ pub(crate) mod testkit {
             forward_proxy_concurrency: 4,
             forward_proxy_idle_timeout_ms: 30_000,
             max_body_bytes: 1000,
+            render_threads: 1,
             global_concurrency: 1,
             per_host_concurrency: 2,
             per_host_spacing_ms: 0,

@@ -25,16 +25,6 @@ pub enum ExportKind {
     All,
 }
 
-/// Page records only.
-pub async fn export(
-    store: &Store,
-    since: Option<&str>,
-    host: Option<&str>,
-    out: Option<&Path>,
-) -> Result<u64, Box<dyn Error>> {
-    export_kind(store, ExportKind::Pages, since, host, out).await
-}
-
 pub async fn export_kind(
     store: &Store,
     kind: ExportKind,

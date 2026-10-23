@@ -72,17 +72,11 @@ mod stored_route {
     use super::Route;
     use serde::{Deserialize, Deserializer, Serializer};
     pub fn serialize<S: Serializer>(route: &Route, s: S) -> Result<S::Ok, S::Error> {
-        s.serialize_str(match route {
-            Route::Direct => "direct",
-            Route::Proxy => "proxy",
-        })
+        s.serialize_str(route.as_str())
     }
     pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Route, D::Error> {
-        match String::deserialize(d)?.as_str() {
-            "direct" => Ok(Route::Direct),
-            "proxy" => Ok(Route::Proxy),
-            _ => Err(serde::de::Error::custom("invalid capture route")),
-        }
+        Route::parse(&String::deserialize(d)?)
+            .ok_or_else(|| serde::de::Error::custom("invalid capture route"))
     }
 }
 
@@ -582,6 +576,31 @@ enum ParsedCapture {
     Pdf(Document, bytes::Bytes),
 }
 
+/// Runs CPU-bound rendering off the async runtime, bounded by the process-wide render slots
+/// and the caller's deadline.
+pub(crate) async fn render_blocking<T: Send + 'static>(
+    deadline: Instant,
+    work: impl FnOnce() -> Result<T, ScrapeError> + Send + 'static,
+) -> Result<T, ScrapeError> {
+    timeout_at(deadline, async {
+        let slots =
+            RENDER_SLOTS.get_or_init(|| Semaphore::new(crate::config::default_render_threads()));
+        let permit = slots.acquire().await.map_err(|_| FetchError::Protocol)?;
+        tokio::task::spawn_blocking(move || {
+            // Cancellation cannot stop a running parser; it must keep its CPU slot until done.
+            let _permit = permit;
+            if Instant::now() >= deadline {
+                return Err(FetchError::Timeout.into());
+            }
+            work()
+        })
+        .await
+        .map_err(|_| ScrapeError::Fetch(FetchError::Protocol))?
+    })
+    .await
+    .map_err(|_| FetchError::Timeout)?
+}
+
 async fn prepare_capture(
     fetched: Fetched,
     req: &ScrapeRequest,
@@ -589,23 +608,10 @@ async fn prepare_capture(
     inspect: bool,
 ) -> Result<Prepared, ScrapeError> {
     let request = req.clone();
-    let parsed = timeout_at(req.deadline, async {
-        let slots =
-            RENDER_SLOTS.get_or_init(|| Semaphore::new(crate::config::default_render_threads()));
-        let permit = slots.acquire().await.map_err(|_| FetchError::Protocol)?;
-        tokio::task::spawn_blocking(move || {
-            // Cancellation cannot stop a running parser; it must keep its CPU slot until done.
-            let _permit = permit;
-            if Instant::now() >= request.deadline {
-                return Err(FetchError::Timeout.into());
-            }
-            parse_capture(fetched, &request, hit, inspect)
-        })
-        .await
-        .map_err(|_| ScrapeError::Fetch(FetchError::Protocol))?
+    let parsed = render_blocking(req.deadline, move || {
+        parse_capture(fetched, &request, hit, inspect)
     })
-    .await
-    .map_err(|_| FetchError::Timeout)??;
+    .await?;
     match parsed {
         ParsedCapture::Page(prepared) => Ok(prepared),
         ParsedCapture::Pdf(mut doc, body) => {

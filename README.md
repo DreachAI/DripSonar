@@ -20,7 +20,7 @@ cargo build --release
 ./target/release/sonar serve                    # 127.0.0.1:3002, data in ./data
 ./target/release/sonar scrape https://example.com
 ./target/release/sonar search "query"
-./target/release/sonar export --out dataset.jsonl
+./target/release/sonar export --kind all --out dataset.jsonl
 ```
 
 Settings are flags or `SONAR_*` environment variables; `sonar --help` lists them and

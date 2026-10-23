@@ -557,7 +557,10 @@ impl Store {
                         .collect::<Result<Vec<String>, _>>()?;
                     tx.commit()?;
                     let deleted = hashes.len();
-                    Ok((deleted, remove_unreferenced(conn, CAPTURE_REFERENCED, &root, hashes)?))
+                    Ok((
+                        deleted,
+                        remove_unreferenced(conn, CAPTURE_REFERENCED, &root, hashes)?,
+                    ))
                 })
                 .await?;
             removed += freed;
@@ -569,11 +572,14 @@ impl Store {
             (0, &self.blobs, CAPTURE_REFERENCED),
             (1, &self.artifacts, ARTIFACT_REFERENCED),
         ] {
-            let cursor = self.orphan_cursors.lock().unwrap_or_else(PoisonError::into_inner)
-                [index]
+            let cursor = self
+                .orphan_cursors
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)[index]
                 .clone();
             let dir = root.clone();
-            let (candidates, next) = blocking(move || Ok(orphan_candidates(&dir, &cursor)?)).await?;
+            let (candidates, next) =
+                blocking(move || Ok(orphan_candidates(&dir, &cursor)?)).await?;
             self.orphan_cursors
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)[index] = next;

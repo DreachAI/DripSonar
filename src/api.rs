@@ -65,8 +65,8 @@ impl AppState {
             fetcher: fetcher.clone(),
             job_config: Arc::new(cfg.clone()),
             browser: BrowserTier::default(),
-            scraper: Scraper::new(fetcher.clone(), store, cfg),
-            searcher: Searcher::new(fetcher, cfg),
+            scraper: Scraper::new(fetcher.clone(), store.clone(), cfg),
+            searcher: Searcher::new(fetcher, cfg).with_store(store.clone()),
             api_key: cfg.api_key.as_deref().map(Arc::from),
             max_timeout_ms: cfg.max_timeout_ms,
             default_max_age_ms: cfg.default_max_age_ms,
@@ -83,6 +83,27 @@ impl AppState {
         self.browser = BrowserTier::start(cfg, fetcher, self.store.clone()).await?;
         self.scraper = self.scraper.with_browser(self.browser.clone());
         Ok(self)
+    }
+
+    /// Rejects an interactive scrape while the data directory is below its free-space floor.
+    async fn ensure_storage(&self) -> Result<(), ApiError> {
+        match self
+            .store
+            .free_disk_ok(self.job_config.min_free_disk_mb)
+            .await
+        {
+            Ok(true) => Ok(()),
+            result => {
+                if let Err(error) = result {
+                    tracing::error!(%error, "free-space check failed");
+                }
+                Err(ApiError {
+                    status: StatusCode::INSUFFICIENT_STORAGE,
+                    code: "SCRAPE_STORAGE_FULL",
+                    message: "Not enough free disk space to store a capture".into(),
+                })
+            }
+        }
     }
 
     /// The browser tier, for shutdown after the server drains.
@@ -480,6 +501,7 @@ async fn scrape(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
     }
     let (request, formats) = state.plan(&opts, &[Format::Markdown])?;
     let plan = browser_plan(&opts, &formats)?;
+    state.ensure_storage().await?;
     let doc = state.scraper.scrape_with(&request, &plan).await?;
     let data = state
         .extracted_document(&doc, &formats, &request.url, &opts)
@@ -516,6 +538,7 @@ async fn search(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
     if formats.is_empty() {
         return Ok(Json(json!({"success": true, "data": hits})));
     }
+    state.ensure_storage().await?;
     let docs: Vec<Map<String, Value>> = futures::stream::iter(hits)
         .map(|hit| {
             let mut request = template.clone();
@@ -575,6 +598,7 @@ async fn web_scrape(
         ..ScrapeOptions::default()
     };
     let (request, _) = state.plan(&opts, &[Format::Markdown])?;
+    state.ensure_storage().await?;
     let (markdown, metadata, cache) = match state.scraper.scrape(&request).await {
         Ok(doc) => {
             let age_ms = doc.cached_at.map_or(0, |at| {

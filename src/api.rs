@@ -494,6 +494,15 @@ fn scrape_failure(error: &ScrapeError) -> (StatusCode, &'static str) {
         ScrapeError::Invalid(_) => (StatusCode::BAD_REQUEST, "BAD_REQUEST"),
         ScrapeError::Blocked => (FAILED, "SCRAPE_ALL_ENGINES_FAILED"),
         ScrapeError::Unsupported(_) => (FAILED, "SCRAPE_UNSUPPORTED_FILE_ERROR"),
+        ScrapeError::Pdf(error) => match error {
+            crate::document::DocumentError::Timeout => {
+                (StatusCode::REQUEST_TIMEOUT, "SCRAPE_TIMEOUT")
+            }
+            crate::document::DocumentError::NoTextLayer => (FAILED, "SCRAPE_PDF_OCR_REQUIRED"),
+            crate::document::DocumentError::Encrypted | crate::document::DocumentError::Failed => {
+                (FAILED, "SCRAPE_UNSUPPORTED_FILE_ERROR")
+            }
+        },
         ScrapeError::Fetch(error) => match error {
             FetchError::Refused(_) => (StatusCode::FORBIDDEN, "SCRAPE_SITE_ERROR"),
             FetchError::Dns => (StatusCode::OK, "SCRAPE_DNS_RESOLUTION_ERROR"),

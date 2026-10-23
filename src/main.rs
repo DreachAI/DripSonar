@@ -31,6 +31,8 @@ enum Command {
     Scrape { url: String },
     /// Search the web and print the hits.
     Search { query: String },
+    #[command(hide = true)]
+    ExtractPdf,
 }
 
 async fn shutdown_signal() {
@@ -81,6 +83,7 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     let cfg = cli.config;
     let fetcher = Fetcher::new(&cfg)?;
     match cli.command {
+        Command::ExtractPdf => dripsonar::document::extract_pdf_stdio()?,
         Command::Serve => serve(&cfg, fetcher).await?,
         Command::Scrape { url } => {
             let scraper = Scraper::new(fetcher, Store::open(&cfg.data_dir)?, &cfg);
@@ -113,6 +116,16 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
 
 #[tokio::main]
 async fn main() -> ExitCode {
+    let cli = Cli::parse();
+    if matches!(cli.command, Command::ExtractPdf) {
+        return match dripsonar::document::extract_pdf_stdio() {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(error) => {
+                eprintln!("{error}");
+                ExitCode::FAILURE
+            }
+        };
+    }
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -120,7 +133,7 @@ async fn main() -> ExitCode {
         )
         .with_ansi(std::io::stdout().is_terminal())
         .init();
-    match run(Cli::parse()).await {
+    match run(cli).await {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => {
             tracing::error!(error = %e, "failed");

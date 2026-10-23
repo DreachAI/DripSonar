@@ -1,0 +1,3 @@
+[submodule "references/firecrawl"]
+	path = references/firecrawl
+	url = https://github.com/firecrawl/firecrawl.git

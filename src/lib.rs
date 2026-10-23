@@ -66,6 +66,7 @@ pub(crate) mod testkit {
             browser_sessions: 2,
             forward_proxy_port: 3003,
             mcp_max_chars: 40_000,
+            mcp_allowed_origins: Vec::new(),
         };
         let loopback = "127.0.0.1".parse().unwrap();
         let private = "10.0.0.1".parse().unwrap();

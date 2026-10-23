@@ -36,8 +36,9 @@ pub(crate) struct Sonar {
 }
 
 /// The `/mcp` service: stateless JSON replies, so no session state is held between requests.
-/// Without an API key, `Host` must be loopback, the bind address, or `SONAR_PUBLIC_URL`
-/// (DNS rebinding guard); a required bearer key already defeats rebinding.
+/// A present `Origin` must be listed in `SONAR_MCP_ALLOWED_ORIGINS`. Without an API key, `Host`
+/// must be loopback, the bind address, or `SONAR_PUBLIC_URL` (DNS rebinding guard); a required
+/// bearer key (never blank, see `Config`) already defeats rebinding.
 pub(crate) fn service(
     state: AppState,
     cfg: &Config,
@@ -46,7 +47,9 @@ pub(crate) fn service(
     let config = StreamableHttpServerConfig::default()
         .with_legacy_session_mode(false)
         .with_json_response(true)
-        .with_max_request_body_bytes(BODY_LIMIT);
+        .with_max_request_body_bytes(BODY_LIMIT)
+        .with_allowed_origins(cfg.mcp_allowed_origins.clone())
+        .enforce_origin_validation();
     let config = if cfg.api_key.is_some() {
         config.disable_allowed_hosts()
     } else {
@@ -241,7 +244,7 @@ impl Sonar {
     async fn search(&self, Parameters(args): Parameters<SearchArgs>) -> CallToolResult {
         let limit = args.limit.unwrap_or(5);
         if !(1..=20).contains(&limit) {
-            return failure("BAD_REQUEST", "limit must be between 1 and 20");
+            return self.failure("BAD_REQUEST", "limit must be between 1 and 20");
         }
         let formats = args.scrape.then(|| json!({"formats": ["fitMarkdown"]}));
         let body = json!({"query": args.query, "limit": limit, "tbs": args.tbs,
@@ -303,10 +306,20 @@ impl Sonar {
             prompt: args.prompt,
         };
         if json.schema.is_none() && json.selectors.is_none() && json.prompt.is_none() {
-            return failure("BAD_REQUEST", "give schema, selectors, or prompt");
+            return self.failure("BAD_REQUEST", "give schema, selectors, or prompt");
         }
-        self.read(scrape_body(&args.url, vec![], Some(json), json!({})), "")
-            .await
+        let body = scrape_body(&args.url, vec![], Some(json), json!({}));
+        let reply = match self.call(Call::Scrape(body)).await {
+            Ok(reply) => reply,
+            Err(failure) => return failure,
+        };
+        let Some(reason) = reply["jsonFailure"].as_str() else {
+            return self.reply(read_view(&reply, ""));
+        };
+        let mut out = pick(&reply["data"]["metadata"], PROVENANCE);
+        out.insert("code".into(), json!("EXTRACT_FAILED"));
+        out.insert("reason".into(), json!(self.reason(reason)));
+        self.finish(Value::Object(out), true)
     }
 
     #[tool(
@@ -316,7 +329,7 @@ impl Sonar {
     async fn map(&self, Parameters(args): Parameters<MapArgs>) -> CallToolResult {
         let limit = args.limit.unwrap_or(200);
         if !(1..=5000).contains(&limit) {
-            return failure("BAD_REQUEST", "limit must be between 1 and 5000");
+            return self.failure("BAD_REQUEST", "limit must be between 1 and 5000");
         }
         let body = json!({"url": args.url, "search": args.search, "limit": limit});
         self.run(Call::Map(compact(body)), |reply| {
@@ -351,31 +364,36 @@ impl Sonar {
     async fn crawl_status(&self, Parameters(args): Parameters<CrawlStatusArgs>) -> CallToolResult {
         let (skip, limit) = (args.skip.unwrap_or(0), args.limit.unwrap_or(10));
         if !(1..=50).contains(&limit) {
-            return failure("BAD_REQUEST", "limit must be between 1 and 50");
+            return self.failure("BAD_REQUEST", "limit must be between 1 and 50");
         }
         let call = Call::CrawlStatus {
             id: args.id,
             skip,
             limit,
         };
-        self.run(call, |reply| {
-            let pages: Vec<Value> = list(&reply["data"])
-                .map(|doc| {
-                    let text = ["fitMarkdown", "markdown", "html"]
-                        .into_iter()
-                        .find(|key| doc.get(key).is_some());
-                    Value::Object(page(doc, text.unwrap_or_default()))
-                })
-                .collect();
-            let mut out = pick(&reply, &["status", "completed", "total"]);
-            if reply.get("next").is_some() {
-                out.insert("nextSkip".into(), json!(skip + pages.len() as u64));
-            }
-            out.insert("pages".into(), json!(pages));
-            out.insert("notice".into(), json!(UNTRUSTED));
-            out
-        })
-        .await
+        let reply = match self.call(call).await {
+            Ok(reply) => reply,
+            Err(failure) => return failure,
+        };
+        let pages: Vec<Value> = list(&reply["data"])
+            .map(|doc| {
+                let text = ["fitMarkdown", "markdown", "html"]
+                    .into_iter()
+                    .find(|key| doc.get(key).is_some());
+                Value::Object(page(doc, text.unwrap_or_default()))
+            })
+            .collect();
+        let fetched = pages.len();
+        let mut out = pick(&reply, &["status", "completed", "total"]);
+        out.insert("pages".into(), json!(pages));
+        out.insert("notice".into(), json!(UNTRUSTED));
+        // The cursor counts the pages that survive the bound, so dropped ones come back next.
+        let mut out = self.shrink(out);
+        let kept = out["pages"].as_array().map_or(0, Vec::len);
+        if reply.get("next").is_some() || kept < fetched {
+            out["nextSkip"] = json!(skip + kept as u64);
+        }
+        self.finish(out, false)
     }
 
     #[tool(description = "Cancel a running crawl.")]
@@ -425,29 +443,39 @@ impl Sonar {
 impl ServerHandler for Sonar {}
 
 impl Sonar {
+    /// Runs `call`; a failure is returned as its tool error.
+    async fn call(&self, call: Call) -> Result<Value, CallToolResult> {
+        self.state
+            .call(call)
+            .await
+            .map_err(|error| self.failure(error.code, &error.message))
+    }
+
     /// Runs `call` and shapes its reply; failures become tool errors, never empty results.
     async fn run(
         &self,
         call: Call,
         view: impl FnOnce(Value) -> Map<String, Value>,
     ) -> CallToolResult {
-        match self.state.call(call).await {
+        match self.call(call).await {
             Ok(reply) => self.reply(view(reply)),
-            Err(error) => failure(error.code, &error.message),
+            Err(failure) => failure,
         }
     }
 
     /// A scrape returning one page whose text is the `text` field.
     async fn read(&self, body: Value, text: &str) -> CallToolResult {
-        self.run(Call::Scrape(body), |reply| {
-            let mut out = page(&reply["data"], text);
-            out.insert("notice".into(), json!(UNTRUSTED));
-            out
-        })
-        .await
+        self.run(Call::Scrape(body), |reply| read_view(&reply, text))
+            .await
     }
 
     fn reply(&self, out: Map<String, Value>) -> CallToolResult {
+        self.finish(self.shrink(out), false)
+    }
+
+    /// Cuts `out` to fit the budget, leaving room for the cut note and a crawl cursor, and
+    /// adds the note when anything was cut.
+    fn shrink(&self, out: Map<String, Value>) -> Value {
         let note = format!(
             "Output exceeded {} characters (SONAR_MCP_MAX_CHARS): long text is cut where marked \
              …[truncated] and long lists were shortened. Ask for less (a smaller limit, a later \
@@ -455,21 +483,64 @@ impl Sonar {
             self.max_chars
         );
         let mut value = Value::Object(out);
-        // Room for the note and its `,"truncated":""` wrapper.
-        let budget = self.max_chars.saturating_sub(note.chars().count() + 16);
-        if bound::bound(&mut value, budget)
-            && let Value::Object(map) = &mut value
-        {
-            map.insert("truncated".into(), json!(note));
+        // `,"truncated":""` and `,"nextSkip":<u64>` take at most 48 characters.
+        let budget = self.max_chars.saturating_sub(note.chars().count() + 48);
+        if bound::bound(&mut value, budget) {
+            value["truncated"] = json!(note);
         }
-        CallToolResult::structured(value)
+        value
+    }
+
+    /// The structured result, or a `RESULT_TOO_LARGE` error when fields that are never cut
+    /// still exceed the budget.
+    fn finish(&self, value: Value, is_error: bool) -> CallToolResult {
+        if value.to_string().chars().count() > self.max_chars {
+            let hint = "the result still exceeds SONAR_MCP_MAX_CHARS after cutting page text; \
+                        ask for less (a smaller limit, one format, fewer actions) or raise it";
+            return self.failure("RESULT_TOO_LARGE", hint);
+        }
+        if is_error {
+            CallToolResult::structured_error(value)
+        } else {
+            CallToolResult::structured(value)
+        }
+    }
+
+    /// A tool error: the Firecrawl code and a one-line reason.
+    fn failure(&self, code: &str, message: &str) -> CallToolResult {
+        let text = format!("{code}: {}", self.reason(message));
+        CallToolResult::error(vec![ContentBlock::text(text)])
+    }
+
+    /// `message` on one line, cut to half the result budget.
+    fn reason(&self, message: &str) -> String {
+        let line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+        let mut chars = line.chars();
+        let head: String = chars.by_ref().take(self.max_chars / 2).collect();
+        if chars.next().is_some() {
+            head + " …[truncated]"
+        } else {
+            head
+        }
     }
 }
 
-/// A tool error: the Firecrawl code and a one-line reason.
-fn failure(code: &str, message: &str) -> CallToolResult {
-    let reason = message.split_whitespace().collect::<Vec<_>>().join(" ");
-    CallToolResult::error(vec![ContentBlock::text(format!("{code}: {reason}"))])
+/// The metadata that says where a page came from and how it was fetched.
+const PROVENANCE: &[&str] = &[
+    "url",
+    "title",
+    "statusCode",
+    "publishedTime",
+    "captureId",
+    "cacheState",
+    "recovery",
+];
+
+/// One scraped page with the untrusted-content notice.
+fn read_view(reply: &Value, text: &str) -> Map<String, Value> {
+    let mut out = page(&reply["data"], text);
+    out.insert("notice".into(), json!(UNTRUSTED));
+    out
 }
 
 /// A v1 scrape body; `extra` holds optional top-level options (nulls are dropped).
@@ -490,19 +561,7 @@ fn scrape_body(url: &str, mut formats: Vec<&str>, json: Option<JsonArgs>, extra:
 
 /// One document for an agent: provenance, extras, and the `text` field as `content`.
 fn page(data: &Value, text: &str) -> Map<String, Value> {
-    let meta = &data["metadata"];
-    let mut page = pick(
-        meta,
-        &[
-            "url",
-            "title",
-            "statusCode",
-            "publishedTime",
-            "captureId",
-            "cacheState",
-            "recovery",
-        ],
-    );
+    let mut page = pick(&data["metadata"], PROVENANCE);
     page.extend(pick(
         data,
         &["json", "changeTracking", "actions", "screenshot", "warning"],

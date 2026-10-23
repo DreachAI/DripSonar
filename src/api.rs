@@ -227,8 +227,25 @@ impl AppState {
         opts: &ScrapeOptions,
         deadline: Instant,
     ) -> Result<Map<String, Value>, ApiError> {
+        let (data, _) = self
+            .extracted_with_failure(doc, formats, source_url, opts, deadline)
+            .await?;
+        Ok(data)
+    }
+
+    /// [`Self::extracted_document`] plus why the requested `json` extraction produced
+    /// nothing, if it did.
+    async fn extracted_with_failure(
+        &self,
+        doc: &Document,
+        formats: &[Format],
+        source_url: &str,
+        opts: &ScrapeOptions,
+        deadline: Instant,
+    ) -> Result<(Map<String, Value>, Option<String>), ApiError> {
         let mut data = document_json(doc, formats, source_url);
         let mut warning = doc.warning.clone();
+        let mut json_failure = None;
         if formats.contains(&Format::ChangeTracking) {
             let (mut request, _) = self.plan(opts, formats)?;
             request.deadline = deadline;
@@ -255,8 +272,9 @@ impl AppState {
             if format == Format::Json && css {
                 let value = doc.rendered.json.clone().unwrap_or(Value::Null);
                 if value.is_null() {
-                    let message = "json: CSS extraction needs an HTML page within the work limit";
-                    extract::append_warning(&mut warning, message);
+                    let message = "CSS extraction needs an HTML page within the work limit";
+                    extract::append_warning(&mut warning, &format!("json: {message}"));
+                    json_failure = Some(message.to_owned());
                 }
                 data.insert("json".into(), value);
                 continue;
@@ -282,6 +300,11 @@ impl AppState {
                 .run(doc.rendered.markdown.as_deref().unwrap_or(""), options)
                 .await;
             usage.add(&result.usage);
+            // The extractor leaves the value null exactly when it produced nothing.
+            if format == Format::Json && result.value.is_null() {
+                let reason = result.warning.as_deref().unwrap_or("LLM extraction failed");
+                json_failure = Some(reason.to_owned());
+            }
             if let Some(message) = result.warning {
                 extract::append_warning(&mut warning, &format!("{name}: {message}"));
             }
@@ -300,7 +323,7 @@ impl AppState {
         {
             metadata.insert("llmUsage".into(), json!(usage));
         }
-        Ok(data)
+        Ok((data, json_failure))
     }
 }
 
@@ -557,16 +580,16 @@ impl IntoResponse for ApiError {
 type Reply = Result<Json<Value>, ApiError>;
 
 async fn scrape(State(state): State<AppState>, body: Result<Bytes, BytesRejection>) -> Reply {
-    let (_, data) = state.scrape_one(parse(body)?).await?;
+    let (_, data, _) = state.scrape_one(parse(body)?).await?;
     Ok(Json(json!({"success": true, "data": data})))
 }
 
 impl AppState {
-    /// One v1 scrape: the document and its Firecrawl `data`.
+    /// One v1 scrape: the document, its Firecrawl `data`, and any `json` extraction failure.
     async fn scrape_one(
         &self,
         opts: ScrapeOptions,
-    ) -> Result<(Document, Map<String, Value>), ApiError> {
+    ) -> Result<(Document, Map<String, Value>, Option<String>), ApiError> {
         if opts.url.is_none() {
             return Err(ApiError::bad_request("missing field `url`"));
         }
@@ -574,14 +597,15 @@ impl AppState {
         let plan = browser_plan(&opts, &formats)?;
         self.ensure_storage().await?;
         let doc = self.scraper.scrape_with(&request, &plan).await?;
-        let data = self
-            .extracted_document(&doc, &formats, &request.url, &opts, request.deadline)
+        let (data, json_failure) = self
+            .extracted_with_failure(&doc, &formats, &request.url, &opts, request.deadline)
             .await?;
-        Ok((doc, data))
+        Ok((doc, data, json_failure))
     }
 
     /// Runs one MCP tool operation through its route's own validation and collection,
-    /// in process. Bodies use the Firecrawl v1 wire shapes.
+    /// in process. Bodies use the Firecrawl v1 wire shapes; a scrape reply also carries
+    /// `jsonFailure`, the reason a requested `json` extraction produced nothing.
     pub(crate) async fn call(&self, call: Call) -> Result<Value, CallError> {
         let body = |value: Value| Ok(Bytes::from(value.to_string()));
         let state = || State(self.clone());
@@ -592,13 +616,15 @@ impl AppState {
         }
         let reply = match call {
             Call::Scrape(value) => {
-                let (doc, mut data) = self.scrape_one(parse(body(value))?).await?;
+                let (doc, mut data, json_failure) = self.scrape_one(parse(body(value))?).await?;
                 if let (Some(id), Some(Value::Object(meta))) =
                     (doc.capture_id, data.get_mut("metadata"))
                 {
                     meta.insert("captureId".into(), json!(id));
                 }
-                Ok(Json(json!({"success": true, "data": data})))
+                Ok(Json(
+                    json!({"success": true, "data": data, "jsonFailure": json_failure}),
+                ))
             }
             Call::Search(value) => search(state(), body(value)).await,
             Call::Map(value) => jobs::map(state(), body(value)).await,

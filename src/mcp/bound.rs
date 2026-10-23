@@ -5,9 +5,22 @@ use serde_json::Value;
 const MARK: &str = " …[truncated]";
 /// Strings are never cut below this length; lists are shortened instead.
 const MIN_KEEP: usize = 200;
+/// Keys whose string value is page text that may be cut. Identifiers, URLs, codes, and
+/// statuses are never cut.
+const TEXT_KEYS: [&str; 6] = [
+    "content",
+    "markdown",
+    "fitMarkdown",
+    "html",
+    "text",
+    "description",
+];
+/// Keys under which every string is extracted or script output that may be cut.
+const TEXT_TREES: [&str; 2] = ["json", "javascriptReturns"];
 
-/// Cuts the longest strings first; while that cannot fit, halves the longest lists. Stops when
-/// `value` serializes within `max` characters. Returns whether anything was cut.
+/// Cuts the longest page texts first; while that cannot fit, halves the longest lists. Stops when
+/// `value` serializes within `max` characters or nothing more can be cut, so callers check the
+/// final size. Returns whether anything was cut.
 pub(super) fn bound(value: &mut Value, max: usize) -> bool {
     let mut cut = false;
     loop {
@@ -24,16 +37,14 @@ pub(super) fn bound(value: &mut Value, max: usize) -> bool {
     }
 }
 
-/// Cuts every string longer than the highest common length that frees `excess` characters;
+/// Cuts every page text longer than the highest common length that frees `excess` characters;
 /// unless `force`, does nothing when even the shortest allowed length would not. Lengths count
 /// JSON escapes, as the budget does.
 fn trim_strings(value: &mut Value, excess: usize, force: bool) -> bool {
     let mark = MARK.chars().count();
     let mut lengths = Vec::new();
-    each(value, &mut |node| {
-        if let Value::String(text) = node {
-            lengths.push(text.chars().map(escaped_len).sum::<usize>());
-        }
+    each_text(value, false, &mut |text| {
+        lengths.push(text.chars().map(escaped_len).sum::<usize>());
     });
     let freed =
         |cap: usize| -> usize { lengths.iter().map(|l| l.saturating_sub(cap + mark)).sum() };
@@ -50,10 +61,8 @@ fn trim_strings(value: &mut Value, excess: usize, force: bool) -> bool {
         }
     }
     let mut cut = false;
-    each(value, &mut |node| {
-        if let Value::String(text) = node
-            && text.chars().map(escaped_len).sum::<usize>() > cap + mark
-        {
+    each_text(value, false, &mut |text| {
+        if text.chars().map(escaped_len).sum::<usize>() > cap + mark {
             let mut kept = 0;
             let head = text.chars().take_while(|&c| {
                 kept += escaped_len(c);
@@ -92,6 +101,25 @@ fn escaped_len(c: char) -> usize {
         '"' | '\\' | '\n' | '\r' | '\t' | '\u{8}' | '\u{c}' => 2,
         c if c < ' ' => 6,
         _ => 1,
+    }
+}
+
+/// Visits the page texts in `value`; `all` marks a subtree whose every string is text.
+fn each_text(value: &mut Value, all: bool, visit: &mut impl FnMut(&mut String)) {
+    match value {
+        Value::String(text) if all => visit(text),
+        Value::Array(items) => items
+            .iter_mut()
+            .for_each(|item| each_text(item, all, visit)),
+        Value::Object(map) => {
+            for (key, item) in map {
+                match item {
+                    Value::String(text) if TEXT_KEYS.contains(&key.as_str()) => visit(text),
+                    _ => each_text(item, all || TEXT_TREES.contains(&key.as_str()), visit),
+                }
+            }
+        }
+        _ => {}
     }
 }
 

@@ -157,7 +157,7 @@ for blocks, otherwise the Firecrawl code) with `error`.
   naming the field rather than silently ignored; `mobile`, `blockAds`, and `storeInCache`
   are accepted as no-ops. `actions`, screenshot formats, and `waitFor` use the browser tier.
 - Auth: when `SONAR_API_KEY` is set, `Authorization: Bearer <key>` is required; otherwise keyless,
-  like self-hosted Firecrawl.
+  like self-hosted Firecrawl. A blank key is refused at startup.
 - Logs carry request IDs, routes, status codes, codes, byte counts, and timings, never page text,
   queries, or credentials.
 - Graceful shutdown stops accepting requests and lets in-flight requests finish within a bound.
@@ -418,14 +418,22 @@ minutes (never below configured spacing); successful 2xx responses halve it towa
   floors, and the browser and job owners are shared with the HTTP API. Scrape replies add the
   capture ID. Replies are reshaped for agents (text as `content`, provenance fields, a notice
   that page text is untrusted data) and returned as JSON text plus identical structured content.
-- Results are bounded by `SONAR_MCP_MAX_CHARS` (default 40000): the longest strings are cut to a
-  common length first (never below 200 characters) and, when that cannot fit, the longest lists
-  are halved; a `truncated` note says so. Failures are tool errors `CODE: reason`, never empty
-  successes; invalid arguments are refused by name.
+- Results are bounded by `SONAR_MCP_MAX_CHARS` (default 40000): the longest page texts
+  (`content`, `markdown`, `fitMarkdown`, `html`, `text`, `description`, and strings under `json`
+  or `javascriptReturns`) are cut to a common length first (never below 200 characters) and,
+  when that cannot fit, the longest lists are halved; a `truncated` note says so. URLs, IDs,
+  codes, and statuses are never cut; a result that still does not fit is `RESULT_TOO_LARGE`.
+  `crawl_status` derives `nextSkip` from the pages kept, so pages dropped by the bound are
+  returned on the next call. Failures are tool errors `CODE: reason` (reason capped at half the
+  budget), never empty successes; invalid arguments are refused by name. `extract` reports a
+  failed extraction (empty page, timeout, provider failure, CSS work limit) as an error
+  `{code: EXTRACT_FAILED, reason, ...provenance}`, flagged by the scrape call, not inferred.
 - `/mcp` sits behind the same bearer check as the API. It is stateless with JSON replies (no
-  sessions or server-initiated streams, so `GET` is 405), bodies are capped at 1 MiB, and without
+  sessions or server-initiated streams, so `GET` is 405), bodies are capped at 1 MiB, a present
+  `Origin` must be listed in `SONAR_MCP_ALLOWED_ORIGINS` (absent `Origin` passes), and without
   an API key the `Host` header must be loopback, the bind address, or `SONAR_PUBLIC_URL`'s host
   (DNS rebinding guard). `sonar mcp` serves stdio with logs on stderr; when another process holds
-  the data directory's job lock, its crawl tools report `SERVICE_UNAVAILABLE`.
+  the data directory's job lock, its crawl tools report `SERVICE_UNAVAILABLE`, and when the
+  external-Chrome forward-proxy port is taken it starts without the browser tier and warns.
 
 The company-signal layers remain later work in [BUILDOUT.md](BUILDOUT.md).

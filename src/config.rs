@@ -43,7 +43,7 @@ pub struct Config {
     pub bind: SocketAddr,
     #[arg(long, env = "SONAR_DATA_DIR", default_value = "./data")]
     pub data_dir: PathBuf,
-    #[arg(long, env = "SONAR_API_KEY", hide_env_values = true)]
+    #[arg(long, env = "SONAR_API_KEY", hide_env_values = true, value_parser = non_blank)]
     pub api_key: Option<Secret>,
     #[arg(long, env = "SONAR_WEBHOOK_SECRET", hide_env_values = true)]
     pub webhook_secret: Option<Secret>,
@@ -126,6 +126,18 @@ pub struct Config {
     /// Characters per MCP tool result; longer text is cut with a note.
     #[arg(long, env = "SONAR_MCP_MAX_CHARS", default_value_t = 40_000, value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1000..))]
     pub mcp_max_chars: usize,
+    /// Browser origins allowed to call `/mcp`, e.g. `https://app.example.com:443`; requests
+    /// without an `Origin` header are always allowed, any other origin is refused.
+    #[arg(long, env = "SONAR_MCP_ALLOWED_ORIGINS", value_delimiter = ',')]
+    pub mcp_allowed_origins: Vec<String>,
+}
+
+/// A blank key would look configured yet accept only an empty bearer token.
+fn non_blank(value: &str) -> Result<Secret, &'static str> {
+    if value.trim().is_empty() {
+        return Err("must not be empty or whitespace; unset it to run without a key");
+    }
+    Ok(Secret(value.to_owned()))
 }
 
 fn at_least_one() -> clap::builder::RangedU64ValueParser<usize> {
@@ -174,6 +186,7 @@ impl fmt::Debug for Config {
             .field("browser_sessions", &self.browser_sessions)
             .field("forward_proxy_port", &self.forward_proxy_port)
             .field("mcp_max_chars", &self.mcp_max_chars)
+            .field("mcp_allowed_origins", &self.mcp_allowed_origins)
             .finish()
     }
 }

@@ -121,11 +121,20 @@ async fn serve_until_signal(cfg: &Config, mut state: api::AppState) -> Result<()
 }
 
 /// MCP over stdio until the client hangs up or a signal arrives. Crawl tools need the job
-/// lock; while `sonar serve` holds it on the same data directory, they report unavailable.
+/// lock and browser tools the forward-proxy port; while `sonar serve` holds them, those tools
+/// report unavailable.
 async fn mcp(cfg: &Config, fetcher: Fetcher) -> Result<(), Box<dyn Error>> {
-    let mut state = api::AppState::new(cfg, fetcher.clone())?
-        .start_browser(cfg, &fetcher)
-        .await?;
+    let state = api::AppState::new(cfg, fetcher.clone())?;
+    let mut state = if forward_proxy_port_in_use(cfg) {
+        tracing::warn!(
+            port = cfg.forward_proxy_port,
+            "browser forward proxy port is in use (is `sonar serve` running? prefer its /mcp); \
+             browser tools disabled"
+        );
+        state
+    } else {
+        state.start_browser(cfg, &fetcher).await?
+    };
     let dispatcher = match state.start_jobs().await {
         Ok(dispatcher) => Some(dispatcher),
         Err(JobError::Locked) => {
@@ -144,6 +153,14 @@ async fn mcp(cfg: &Config, fetcher: Fetcher) -> Result<(), Box<dyn Error>> {
     }
     state.browser().shutdown().await;
     served
+}
+
+/// An external Chrome reaches the web only through the fixed forward-proxy port, which a
+/// running `sonar serve` already holds; a launched Chrome uses a fresh port instead.
+fn forward_proxy_port_in_use(cfg: &Config) -> bool {
+    cfg.chrome_ws.is_some()
+        && std::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, cfg.forward_proxy_port))
+            .is_err_and(|error| error.kind() == std::io::ErrorKind::AddrInUse)
 }
 
 async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {

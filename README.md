@@ -44,7 +44,9 @@ search backend. EC2 deployment: [deploy/README.md](deploy/README.md) and [script
 
 The MCP server gives agents the tools `search`, `scrape`, `extract`, `map`, `crawl_start`,
 `crawl_status`, `crawl_cancel`, `browser_open`, `browser_step`, and `browser_close`. Results are
-capped at `SONAR_MCP_MAX_CHARS` (default 40000) with a note when cut.
+capped at `SONAR_MCP_MAX_CHARS` (default 40000): page text is cut with a note, and a result
+that still does not fit is a `RESULT_TOO_LARGE` error. Browser-based clients must have their
+origin listed in `SONAR_MCP_ALLOWED_ORIGINS` (comma-separated, e.g. `https://app.example:443`).
 
 Claude Code (add `--header "Authorization: Bearer $SONAR_API_KEY"` when a key is set):
 
@@ -73,8 +75,10 @@ OpenCode (`opencode.json`):
 }
 ```
 
-Drop `headers` when no key is set. A stdio server sharing a data directory with a running
-`sonar serve` works, but its crawl tools report unavailable (the server owns the job lock).
+Drop `headers` when no key is set; a set `SONAR_API_KEY` must not be blank. While `sonar serve`
+runs, prefer its `/mcp` endpoint: a stdio server alongside it works, but its crawl tools report
+unavailable (the server owns the job lock) and, with an external Chrome, it starts without
+browser tools (the server owns the forward-proxy port).
 
 ## Repository map
 

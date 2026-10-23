@@ -27,13 +27,14 @@ const MAX_HEAD: usize = 32 * 1024;
 pub struct ForwardProxy;
 
 impl ForwardProxy {
-    /// The token is the Basic-auth password; the username is `sonar`.
-    /// Aborting the returned task also aborts its active connections.
+    /// Listens on loopback `port` (0 picks a free one). The token is the Basic-auth password;
+    /// the username is `sonar`. Aborting the returned task also aborts its active connections.
     pub async fn start(
+        port: u16,
         fetch_guard: Arc<FetchGuard>,
         route_cfg: RouteConfig,
     ) -> io::Result<(SocketAddr, String, JoinHandle<()>)> {
-        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await?;
+        let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, port)).await?;
         let addr = listener.local_addr()?;
         let token = uuid::Uuid::new_v4().simple().to_string();
         let authorization = format!("Basic {}", base64(format!("sonar:{token}").as_bytes()));

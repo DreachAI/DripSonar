@@ -135,11 +135,12 @@ for blocks, otherwise the Firecrawl code) with `error`.
 
 ## API (`api`)
 
-- Routes: `/v1/scrape`, `/v1/search`, `/v1/web/scrape`, `/v1/web/search`, `GET /health`.
+- Routes: `/v1/scrape`, `/v1/search`, `/v1/web/scrape`, `/v1/web/search`, `GET /health`, and the
+  browser session and artifact routes (Browser tier below).
 - Request bodies deny unknown fields and are capped at 1 MiB. Fields Firecrawl accepts but this
-  slice does not implement (`actions`, `json`/`extract` formats, `screenshot`, `location`) are
-  rejected with `BAD_REQUEST` naming the field rather than silently ignored; `waitFor`, `mobile`,
-  `blockAds`, `proxy`, and `storeInCache` are accepted and recorded as no-ops where harmless.
+  engine does not implement (`json`/`extract` formats, `location`) are rejected with `BAD_REQUEST`
+  naming the field rather than silently ignored; `mobile`, `blockAds`, `proxy`, and `storeInCache`
+  are accepted as no-ops. `actions`, screenshot formats, and `waitFor` use the browser tier.
 - Auth: when `SONAR_API_KEY` is set, `Authorization: Bearer <key>` is required; otherwise keyless,
   like self-hosted Firecrawl.
 - Logs carry request IDs, routes, status codes, codes, byte counts, and timings, never page text,
@@ -193,17 +194,59 @@ DECISIONS.md. Each slice is a module with one owner; `api` gains routes, `scrape
 
 ### Browser tier (`browser`)
 
-- Crate: `chromiumoxide` (async tokio, full DevTools protocol). One Chrome process, a semaphore of
-  N tabs (default 4), a per-page timeout, restart every 200 pages or on any handler error, child
-  killed on drop, a fresh `--user-data-dir` per launch. Disabled unless `SONAR_CHROME_PATH` is set.
-- Escalation: plain HTTP first. The browser runs only when the request asks (`waitFor` > 0 or
-  `actions`), or when the plain response is HTML whose rendered text is tiny but whose body carries
-  script-shell markers (a root `div` with no text, `__NEXT_DATA__` without content, `noscript`
-  warnings). Never on a block or challenge.
-- Guard: Chrome is launched with `--proxy-server=http://127.0.0.1:<port>` and
-  `--proxy-bypass-list=<-loopback>`, pointing at an in-process forward proxy (`egress`) that resolves,
-  checks, and dials the checked address (directly or through the SOCKS5 route), and refuses
-  everything else. WebRTC non-proxied UDP is disabled. The rendered HTML goes through `page` as usual.
+As built (2026-10-22 browser council, DECISIONS.md). Crate `chromiumoxide` 0.9; no chromiumoxide
+type leaves `browser`.
+
+- **Chrome:** one supervised Chrome. `SONAR_CHROME_WS` connects to an external Chrome confined by
+  `deploy/sonar-chrome.service` (loopback-only IP filter; production). `SONAR_CHROME_PATH` launches a
+  child Chrome with a fresh `--user-data-dir` (development; no OS confinement). Neither set: the tier
+  is off and actions, screenshots, `waitFor > 0`, and sessions fail with
+  `SCRAPE_ALL_ENGINES_FAILED` ("browser tier not configured"). Chrome starts on first use.
+- **Egress:** Chrome's only route is the guarded forward proxy (`egress`): `--proxy-server` to it
+  (fixed `SONAR_FORWARD_PROXY_PORT`, default 3003, for the external unit; a random port for a child),
+  `--proxy-bypass-list=<-loopback>`, `--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1`,
+  `--disable-quic`, WebRTC `disable_non_proxied_udp`. `Fetch` interception runs on the browser
+  session, so it alone answers auth: our proxy's challenge gets the per-process token once per
+  request; site challenges are cancelled. The top-level URL first passes the guard, DNS policy, and
+  the per-host gate (held for the visit); subresources take no gate slot.
+- **Per visit:** a fresh browser context (disposed on detach) and one tab, 1280x800, declared user
+  agent set per tab, downloads denied, popups closed. Caller headers go only to the requested
+  origin's main-frame requests. Text-only visits block images, fonts, and media. Top-level redirects
+  are capped at 5 and HTTPS-to-HTTP is refused. Navigation waits for load (at most 3 s) plus 500 ms;
+  then `waitFor`, actions, the format screenshot, and the final DOM, in Firecrawl's order. The
+  status is the document's real navigation status; unknown fails the visit.
+- **Limits:** 4 tabs (`SONAR_BROWSER_TABS`), 16 queued (then `CONCURRENCY_QUEUE_TIMEOUT`), queueing
+  counts against the deadline; 10 s per DevTools command (navigation: the request deadline), 2 s
+  cleanup or the instance is failed. Retire after 200 visits (`SONAR_BROWSER_RECYCLE_PAGES`): drain
+  one-shot visits, ask Chrome to exit (systemd restarts the external one). A child's process tree
+  over `SONAR_BROWSER_MEMORY_MB` (Linux `/proc`, sampled each second) or a lost connection kills the
+  instance; 3 failures a minute cool down for 30 s. Actions are never replayed.
+- **Escalation (`policy`):** plain HTTP first. Escalate only a 2xx HTML page with fewer than 200
+  visible characters and a concrete shell marker (empty app root plus external or module scripts, or
+  a JavaScript-required notice); never challenges or error statuses. A render is used only if it
+  shows at least 200 visible characters and twice the HTTP text; then its origin goes browser-first
+  for 10 minutes (at most 4,096 origins); a failed render forgets it and falls back to HTTP.
+- **Cache:** rendered captures live in their own key namespace (URL, headers, user agent, viewport,
+  asset policy, route, policy version) and are stored with `tier = 'browser'` (column added in place;
+  older rows are HTTP) as UTF-8 HTML. Automatic renders honor `maxAge` and share identical concurrent
+  visits; explicit visits skip cache reads and sharing, and those with actions are stored under a key
+  no lookup produces.
+- **Actions:** Firecrawl v1 `wait`, `click`, `write`, `press`, `scroll`, `screenshot`, `scrape`,
+  `executeJavascript`; `pdf` is refused. Validated before fetching: 50 actions, 60 s total wait
+  (selector waits count 1 s), selectors 2 KiB, text and scripts 64 KiB, known keys and modifiers.
+  An action that starts a navigation waits for the new document. Results:
+  `actions: {screenshots, scrapes, javascriptReturns, pdfs: []}`; a failure is
+  `SCRAPE_ACTION_ERROR` naming the action's index and type, never logging its arguments.
+- **Screenshots:** formats `screenshot` and `screenshot@fullPage` (above 16 megapixels fails), PNG or
+  JPEG with `quality`, 8 MiB each and 32 MiB per request. Stored through the blob writer under
+  `blobs/artifacts` with an `artifacts` row (random 256-bit ID, hash, media type, size, 24 h
+  expiry; 1 GiB total). Returned as `SONAR_PUBLIC_URL/v1/artifacts/<id>` (default
+  `http://<bind>`), served without the API key with `nosniff`; a sweeper deletes expired ones.
+- **Sessions:** `POST /v1/browser {url, timeout?, formats?}` → `{success, id, url, markdown,
+  screenshot?}`; `POST /v1/browser/:id {actions, formats?, timeout?}` → `{success, url, markdown,
+  screenshot?, actions}`; `DELETE /v1/browser/:id`. One tab each, steps serialized, at most
+  `SONAR_BROWSER_SESSIONS` (default 2, capped at tabs − 1), 120 s idle, 15 min lifetime, reaped every
+  10 s; a Chrome restart ends them.
 
 ### Egress and proxy route (`egress`)
 
@@ -232,6 +275,5 @@ DECISIONS.md. Each slice is a module with one owner; `api` gains routes, `scrape
 
 ### Later
 
-LLM `json`/`extract` formats through an OpenAI-compatible endpoint with a spend cap; screenshots
-from the browser tier; change tracking from stored captures; then the company-signal layers in
+LLM `json`/`extract` formats through an OpenAI-compatible endpoint with a spend cap; change tracking from stored captures; then the company-signal layers in
 [BUILDOUT.md](BUILDOUT.md).

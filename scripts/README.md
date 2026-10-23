@@ -12,7 +12,7 @@ To add one: `cp scripts/_template.sh scripts/<name>.sh`, edit, `chmod +x`, add a
 | --- | --- |
 | `build-release.sh [arch]` | Cross-build a Linux release binary (x86_64 or aarch64); prints its path. |
 | `deploy.sh <ssh-host>` | Build, upload, swap in, restart, and health-check on the host. |
-| `server-setup.sh` | One-time host setup (user, data dir, env file, optional Chromium); run on the host. |
+| `server-setup.sh` | One-time host setup (user, data dir, env file, optional Chromium and its `sonar-chrome` user); run on the host. |
 | `logs.sh <ssh-host> [lines]` | Follow the service's journald logs. |
 
 Deploy details: [../deploy/README.md](../deploy/README.md).

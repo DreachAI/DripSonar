@@ -15,7 +15,7 @@ use self::gate::{Gate, Pass};
 pub use crate::egress::Route;
 use crate::{
     config::Config,
-    egress::{DnsFailure, FetchGuard as Guard, GuardedResolver, Refusal, RouteConfig},
+    egress::{DnsFailure, FetchGuard as Guard, GuardError, GuardedResolver, Refusal, RouteConfig},
 };
 
 /// Redirects followed per fetch; one more is `TooManyRedirects`.
@@ -86,6 +86,11 @@ pub enum FetchError {
     Protocol,
 }
 
+/// One global and one per-host fetch slot, held for a whole browser visit.
+pub struct Admission {
+    _pass: Pass,
+}
+
 #[derive(Clone)]
 pub struct Fetcher {
     client: reqwest::Client,
@@ -150,6 +155,24 @@ impl Fetcher {
     /// Cloning preserves the shared daily byte budget.
     pub fn route_config(&self) -> RouteConfig {
         self.routes.clone()
+    }
+
+    /// Admits a browser visit: the guard and DNS policy first, so refusals and DNS failures
+    /// classify as they do for fetches, then the same global and per-host slots. Subresources
+    /// go through the forward proxy and never take a slot, so a page cannot deadlock itself.
+    pub async fn admit(&self, url: &Url, deadline: Instant) -> Result<Admission, FetchError> {
+        timeout_at(deadline, self.guard.resolve_url(url))
+            .await
+            .map_err(|_| FetchError::Timeout)?
+            .map_err(|error| match error {
+                GuardError::Refused(refusal) => FetchError::Refused(refusal.0),
+                GuardError::Dns(_) => FetchError::Dns,
+            })?;
+        let pass = self
+            .gate
+            .enter(url.host_str().unwrap_or_default(), deadline)
+            .await?;
+        Ok(Admission { _pass: pass })
     }
 
     /// One guarded exchange; `target.deadline` covers queueing, redirects, retries, and body.

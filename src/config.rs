@@ -44,6 +44,29 @@ pub struct Config {
     pub max_timeout_ms: u64,
     #[arg(long, env = "SONAR_DEFAULT_MAX_AGE_MS", default_value_t = 86_400_000)]
     pub default_max_age_ms: u64,
+    // Browser tier: disabled unless one of the two Chrome settings is present.
+    /// Launch a child Chrome from this binary (development; no OS egress confinement).
+    #[arg(long, env = "SONAR_CHROME_PATH", conflicts_with = "chrome_ws")]
+    pub chrome_path: Option<PathBuf>,
+    /// DevTools endpoint of an externally confined Chrome, e.g. `http://127.0.0.1:9222`.
+    #[arg(long, env = "SONAR_CHROME_WS")]
+    pub chrome_ws: Option<url::Url>,
+    #[arg(long, env = "SONAR_BROWSER_TABS", default_value_t = 4, value_parser = at_least_one())]
+    pub browser_tabs: usize,
+    /// Chrome process-tree memory ceiling; enforced only for a child Chrome on Linux.
+    #[arg(long, env = "SONAR_BROWSER_MEMORY_MB", default_value_t = 2048, value_parser = clap::value_parser!(u64).range(1..))]
+    pub browser_memory_mb: u64,
+    #[arg(long, env = "SONAR_BROWSER_RECYCLE_PAGES", default_value_t = 200, value_parser = at_least_one())]
+    pub browser_recycle_pages: usize,
+    /// Multi-step sessions; capped at one less than the tab count.
+    #[arg(long, env = "SONAR_BROWSER_SESSIONS", default_value_t = 2)]
+    pub browser_sessions: usize,
+    /// Fixed loopback port of the browser forward proxy when Chrome is external.
+    #[arg(long, env = "SONAR_FORWARD_PROXY_PORT", default_value_t = 3003, value_parser = clap::value_parser!(u16).range(1..))]
+    pub forward_proxy_port: u16,
+    /// Base URL for links this server hands out (screenshots, job pages).
+    #[arg(long, env = "SONAR_PUBLIC_URL")]
+    pub public_url: Option<url::Url>,
 }
 
 fn at_least_one() -> clap::builder::RangedU64ValueParser<usize> {
@@ -73,6 +96,14 @@ impl fmt::Debug for Config {
             .field("per_host_spacing_ms", &self.per_host_spacing_ms)
             .field("max_timeout_ms", &self.max_timeout_ms)
             .field("default_max_age_ms", &self.default_max_age_ms)
+            .field("chrome_path", &self.chrome_path)
+            .field("chrome_ws", &self.chrome_ws)
+            .field("browser_tabs", &self.browser_tabs)
+            .field("browser_memory_mb", &self.browser_memory_mb)
+            .field("browser_recycle_pages", &self.browser_recycle_pages)
+            .field("browser_sessions", &self.browser_sessions)
+            .field("forward_proxy_port", &self.forward_proxy_port)
+            .field("public_url", &self.public_url)
             .finish()
     }
 }

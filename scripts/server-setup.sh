@@ -8,7 +8,8 @@ usage() {
 Usage: ssh <host> 'sudo bash -s' < scripts/server-setup.sh
   Creates user sonar, /var/lib/sonar, and /etc/sonar/sonar.env (if missing).
 Env:
-  INSTALL_CHROME=1  also install Chromium (apt or dnf)
+  INSTALL_CHROME=1  also install Chromium (apt or dnf) and create user sonar-chrome
+                    for deploy/sonar-chrome.service
 USAGE
 }
 
@@ -40,6 +41,7 @@ if [[ "${INSTALL_CHROME:-0}" == 1 ]]; then
   else
     die "no apt-get or dnf; install Chromium manually"
   fi
+  id sonar-chrome >/dev/null 2>&1 || useradd --system --shell /usr/sbin/nologin --home-dir /nonexistent --no-create-home sonar-chrome
 fi
 
 echo "setup done (file descriptor limit comes from the unit: LimitNOFILE)"

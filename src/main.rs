@@ -5,6 +5,7 @@ use std::{error::Error, io::IsTerminal, process::ExitCode, sync::Arc, time::Dura
 use clap::{Parser, Subcommand};
 use dripsonar::{
     api,
+    browser::BrowserTier,
     config::Config,
     net::Fetcher,
     page::RenderOptions,
@@ -52,10 +53,20 @@ async fn shutdown_signal() {
     }
 }
 
+/// Serves until a signal; the browser tier stops after in-flight requests have drained.
+async fn serve(cfg: &Config, fetcher: Fetcher) -> Result<(), Box<dyn Error>> {
+    let state = api::AppState::new(cfg, fetcher.clone())?
+        .start_browser(cfg, &fetcher)
+        .await?;
+    let browser = state.browser();
+    let served = serve_until_signal(cfg, state).await;
+    browser.shutdown().await;
+    served
+}
+
 /// Stops accepting on a signal, then gives in-flight requests up to the longest request
 /// timeout to finish.
-async fn serve(cfg: &Config, fetcher: Fetcher) -> Result<(), Box<dyn Error>> {
-    let state = api::AppState::new(cfg, fetcher)?;
+async fn serve_until_signal(cfg: &Config, state: api::AppState) -> Result<(), Box<dyn Error>> {
     let listener = tokio::net::TcpListener::bind(cfg.bind).await?;
     tracing::info!(bind = %cfg.bind, "serving");
     let stop = Arc::new(tokio::sync::Notify::new());
@@ -86,7 +97,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
         Command::ExtractPdf => dripsonar::document::extract_pdf_stdio()?,
         Command::Serve => serve(&cfg, fetcher).await?,
         Command::Scrape { url } => {
-            let scraper = Scraper::new(fetcher, Store::open(&cfg.data_dir)?, &cfg);
+            let store = Store::open(&cfg.data_dir)?;
+            let browser = BrowserTier::start(&cfg, &fetcher, store.clone()).await?;
+            let scraper = Scraper::new(fetcher, store, &cfg).with_browser(browser.clone());
             let request = ScrapeRequest {
                 url,
                 headers: Vec::new(),
@@ -100,8 +113,9 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
                 },
                 raw_html: false,
             };
-            let doc = scraper.scrape(&request).await?;
-            println!("{}", doc.rendered.markdown.unwrap_or_default());
+            let doc = scraper.scrape(&request).await;
+            browser.shutdown().await;
+            println!("{}", doc?.rendered.markdown.unwrap_or_default());
         }
         Command::Search { query } => {
             let deadline = Instant::now() + Duration::from_secs(60);

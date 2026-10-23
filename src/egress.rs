@@ -16,7 +16,7 @@ use crate::config::Config;
 
 pub use forward::ForwardProxy;
 pub use guard::FetchGuard;
-pub(crate) use guard::{DnsFailure, GuardedResolver, Refusal};
+pub(crate) use guard::{DnsFailure, GuardError, GuardedResolver, Refusal};
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum Route {

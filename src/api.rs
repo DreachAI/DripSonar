@@ -2,6 +2,8 @@
 //!
 //! `/v1/scrape` and `/v1/search` speak Firecrawl v1; `/v1/web/*` speak context.dev.
 
+mod browser;
+
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
 use axum::{
@@ -21,6 +23,7 @@ use tokio::time::Instant;
 use tracing::Instrument;
 
 use crate::{
+    browser::{Action, BrowserError, BrowserPlan, BrowserTier, Shot},
     config::Config,
     net::{FetchError, Fetcher},
     page::RenderOptions,
@@ -42,18 +45,38 @@ pub struct AppState {
     api_key: Option<Arc<str>>,
     max_timeout_ms: u64,
     default_max_age_ms: u64,
+    store: Store,
+    browser: BrowserTier,
 }
 
 impl AppState {
     pub fn new(cfg: &Config, fetcher: Fetcher) -> Result<Self, StoreError> {
         let store = Store::open(&cfg.data_dir)?;
         Ok(Self {
+            store: store.clone(),
+            browser: BrowserTier::default(),
             scraper: Scraper::new(fetcher.clone(), store, cfg),
             searcher: Searcher::new(fetcher, cfg),
             api_key: cfg.api_key.as_deref().map(Arc::from),
             max_timeout_ms: cfg.max_timeout_ms,
             default_max_age_ms: cfg.default_max_age_ms,
         })
+    }
+
+    /// Starts the browser tier when configured and hands it to scrapes and sessions.
+    pub async fn start_browser(
+        mut self,
+        cfg: &Config,
+        fetcher: &Fetcher,
+    ) -> Result<Self, BrowserError> {
+        self.browser = BrowserTier::start(cfg, fetcher, self.store.clone()).await?;
+        self.scraper = self.scraper.with_browser(self.browser.clone());
+        Ok(self)
+    }
+
+    /// The browser tier, for shutdown after the server drains.
+    pub fn browser(&self) -> BrowserTier {
+        self.browser.clone()
     }
 
     /// The requested timeout (at least one second), clamped to the server maximum.
@@ -100,15 +123,32 @@ impl AppState {
     }
 }
 
+/// The browser part of scrape options; validated before anything is fetched.
+fn browser_plan(opts: &ScrapeOptions, formats: &[Format]) -> Result<BrowserPlan, ApiError> {
+    crate::browser::validate_plan(
+        opts.actions.clone(),
+        opts.wait_for,
+        screenshot_format(formats)?,
+    )
+    .map_err(|error| ApiError::bad_request(error.to_string()))
+}
+
 pub fn router(state: AppState) -> Router {
     let v1 = Router::new()
         .route("/v1/scrape", post(scrape))
         .route("/v1/search", post(search))
         .route("/v1/web/scrape", post(web_scrape))
         .route("/v1/web/search", post(web_search))
+        .route("/v1/browser", post(browser::open))
+        .route(
+            "/v1/browser/{id}",
+            post(browser::step).delete(browser::close),
+        )
         .route_layer(middleware::from_fn_with_state(state.clone(), authorize));
     Router::new()
         .route("/health", get(|| async { "ok" }))
+        // Capability URLs: the unguessable ID is the credential, as Firecrawl's are.
+        .route("/v1/artifacts/{id}", get(browser::artifact))
         .merge(v1)
         .layer(DefaultBodyLimit::max(BODY_LIMIT))
         .layer(middleware::from_fn(observe))
@@ -122,10 +162,29 @@ enum Format {
     Html,
     RawHtml,
     Links,
+    Screenshot,
+    #[serde(rename = "screenshot@fullPage")]
+    ScreenshotFullPage,
+}
+
+/// The format screenshot, if any; asking for both kinds is refused, as Firecrawl does.
+fn screenshot_format(formats: &[Format]) -> Result<Option<Shot>, ApiError> {
+    match (
+        formats.contains(&Format::Screenshot),
+        formats.contains(&Format::ScreenshotFullPage),
+    ) {
+        (true, true) => Err(ApiError::bad_request(
+            "You may only specify either screenshot or screenshot@fullPage",
+        )),
+        (viewport, full_page) => Ok((viewport || full_page).then_some(Shot {
+            full_page,
+            quality: None,
+        })),
+    }
 }
 
 /// Firecrawl v1 scrape options. Unknown fields, including the known-but-unimplemented
-/// `actions`, `jsonOptions`, `extract`, and `location`, are refused by name.
+/// `jsonOptions`, `extract`, and `location`, are refused by name.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct ScrapeOptions {
@@ -141,9 +200,12 @@ struct ScrapeOptions {
     timeout: Option<u64>,
     #[serde(default)]
     wait_for: u64,
+    #[serde(default)]
+    actions: Vec<Action>,
     remove_base64_images: Option<bool>,
     max_age: Option<u64>,
-    // Accepted no-ops: no browser, ad blocker, or proxy tier yet; captures are always stored.
+    // Accepted no-ops: a fixed desktop viewport, no ad blocker or proxy choice; captures are
+    // always stored.
     #[serde(rename = "mobile")]
     _mobile: Option<bool>,
     #[serde(rename = "blockAds")]
@@ -242,6 +304,12 @@ impl From<ScrapeError> for ApiError {
     }
 }
 
+impl From<BrowserError> for ApiError {
+    fn from(error: BrowserError) -> Self {
+        ScrapeError::Browser(error).into()
+    }
+}
+
 impl From<SearchError> for ApiError {
     fn from(error: SearchError) -> Self {
         let (status, code) = match error {
@@ -272,7 +340,8 @@ async fn scrape(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
         return Err(ApiError::bad_request("missing field `url`"));
     }
     let (request, formats) = state.plan(&opts, &[Format::Markdown])?;
-    let doc = state.scraper.scrape(&request).await?;
+    let plan = browser_plan(&opts, &formats)?;
+    let doc = state.scraper.scrape_with(&request, &plan).await?;
     let data = document_json(&doc, &formats, &request.url);
     Ok(Json(json!({"success": true, "data": data})))
 }
@@ -290,6 +359,7 @@ async fn search(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
     }
     let deadline = Instant::now() + state.timeout(body.timeout, SEARCH_TIMEOUT_MS)?;
     let (template, formats) = state.plan(&body.scrape_options, &[])?;
+    let plan = browser_plan(&body.scrape_options, &formats)?;
     let lang = body.lang.as_deref().unwrap_or("en");
     let hits = state
         .searcher
@@ -309,10 +379,10 @@ async fn search(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
             let mut request = template.clone();
             request.url = hit.url.clone();
             request.deadline = request.deadline.min(deadline);
-            let (scraper, formats) = (&state.scraper, &formats);
+            let (scraper, formats, plan) = (&state.scraper, &formats, &plan);
             async move {
                 let mut item = hit_json(&hit);
-                match scraper.scrape(&request).await {
+                match scraper.scrape_with(&request, plan).await {
                     Ok(doc) => item.extend(document_json(&doc, formats, &hit.url)),
                     Err(error) => {
                         tracing::info!(code = scrape_failure(&error).1, "hit not scraped");
@@ -436,8 +506,14 @@ fn document_json(doc: &Document, formats: &[Format], source_url: &str) -> Map<St
             Format::Html => ("html", json!(rendered.html.clone().unwrap_or_default())),
             Format::RawHtml => ("rawHtml", json!(doc.raw_html.clone().unwrap_or_default())),
             Format::Links => ("links", json!(rendered.links.clone().unwrap_or_default())),
+            Format::Screenshot | Format::ScreenshotFullPage => {
+                ("screenshot", json!(doc.browser.screenshot))
+            }
         };
         data.insert(name.into(), value);
+    }
+    if let Some(actions) = &doc.browser.actions {
+        data.insert("actions".into(), json!(actions));
     }
     data.insert("metadata".into(), metadata_json(doc, source_url));
     data
@@ -503,17 +579,31 @@ fn scrape_failure(error: &ScrapeError) -> (StatusCode, &'static str) {
                 (FAILED, "SCRAPE_UNSUPPORTED_FILE_ERROR")
             }
         },
-        ScrapeError::Fetch(error) => match error {
-            FetchError::Refused(_) => (StatusCode::FORBIDDEN, "SCRAPE_SITE_ERROR"),
-            FetchError::Dns => (StatusCode::OK, "SCRAPE_DNS_RESOLUTION_ERROR"),
-            FetchError::Timeout => (StatusCode::REQUEST_TIMEOUT, "SCRAPE_TIMEOUT"),
-            FetchError::Tls => (FAILED, "SCRAPE_SSL_ERROR"),
-            FetchError::Overloaded => (StatusCode::REQUEST_TIMEOUT, "CONCURRENCY_QUEUE_TIMEOUT"),
-            FetchError::Connect
-            | FetchError::TooManyRedirects
-            | FetchError::TooLarge
-            | FetchError::Protocol => (FAILED, "SCRAPE_SITE_ERROR"),
+        ScrapeError::Fetch(error) => fetch_failure(error),
+        ScrapeError::Browser(error) => match error {
+            BrowserError::Fetch(error) => fetch_failure(error),
+            BrowserError::Action { .. } => (FAILED, "SCRAPE_ACTION_ERROR"),
+            BrowserError::SessionNotFound => (StatusCode::NOT_FOUND, "BROWSER_SESSION_NOT_FOUND"),
+            BrowserError::SessionLimit => (StatusCode::TOO_MANY_REQUESTS, "BROWSER_SESSION_LIMIT"),
+            BrowserError::Disabled | BrowserError::Unavailable(_) | BrowserError::Limit(_) => {
+                (FAILED, "SCRAPE_ALL_ENGINES_FAILED")
+            }
         },
+    }
+}
+
+fn fetch_failure(error: &FetchError) -> (StatusCode, &'static str) {
+    const FAILED: StatusCode = StatusCode::INTERNAL_SERVER_ERROR;
+    match error {
+        FetchError::Refused(_) => (StatusCode::FORBIDDEN, "SCRAPE_SITE_ERROR"),
+        FetchError::Dns => (StatusCode::OK, "SCRAPE_DNS_RESOLUTION_ERROR"),
+        FetchError::Timeout => (StatusCode::REQUEST_TIMEOUT, "SCRAPE_TIMEOUT"),
+        FetchError::Tls => (FAILED, "SCRAPE_SSL_ERROR"),
+        FetchError::Overloaded => (StatusCode::REQUEST_TIMEOUT, "CONCURRENCY_QUEUE_TIMEOUT"),
+        FetchError::Connect
+        | FetchError::TooManyRedirects
+        | FetchError::TooLarge
+        | FetchError::Protocol => (FAILED, "SCRAPE_SITE_ERROR"),
     }
 }
 

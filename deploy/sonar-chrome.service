@@ -1,0 +1,35 @@
+[Unit]
+Description=Headless Chrome for DripSonar's browser tier (loopback only)
+After=network-online.target
+
+[Service]
+User=sonar-chrome
+Group=sonar-chrome
+# The only route out is sonar's guarded forward proxy on 127.0.0.1:3003 (SONAR_FORWARD_PROXY_PORT).
+# This per-unit filter drops every other packet, UDP included; the flags below are not the guarantee.
+IPAddressDeny=any
+IPAddressAllow=localhost
+# sonar connects with SONAR_CHROME_WS=http://127.0.0.1:9222 and sets the user agent per tab.
+# If the binary lives elsewhere (for example chromium-browser), override ExecStart with
+# `systemctl edit sonar-chrome`. If the sandbox cannot start on this host, add --no-sandbox;
+# the IP filter above stays the boundary.
+ExecStart=/usr/bin/chromium --headless=new \
+  --remote-debugging-address=127.0.0.1 --remote-debugging-port=9222 \
+  --user-data-dir=/tmp/sonar-chrome \
+  --proxy-server=http://127.0.0.1:3003 "--proxy-bypass-list=<-loopback>" \
+  "--host-resolver-rules=MAP * ~NOTFOUND , EXCLUDE 127.0.0.1" \
+  --force-webrtc-ip-handling-policy=disable_non_proxied_udp --disable-quic \
+  --window-size=1280,800 --no-first-run --no-default-browser-check --disable-extensions \
+  --disable-background-networking --disable-component-update --disable-domain-reliability \
+  --disable-sync --no-pings --hide-scrollbars --mute-audio --disable-dev-shm-usage
+# sonar retires Chrome every SONAR_BROWSER_RECYCLE_PAGES visits by asking it to exit.
+Restart=always
+RestartSec=1
+MemoryMax=2G
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+Environment=HOME=/tmp
+
+[Install]
+WantedBy=multi-user.target

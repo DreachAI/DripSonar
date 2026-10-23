@@ -20,7 +20,7 @@ pub(crate) struct Refusal(pub(crate) String);
 pub(crate) struct DnsFailure;
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum GuardError {
+pub(crate) enum GuardError {
     #[error(transparent)]
     Refused(#[from] Refusal),
     #[error(transparent)]
@@ -99,7 +99,7 @@ impl FetchGuard {
         Ok(addrs)
     }
 
-    pub(super) async fn resolve_url(&self, url: &Url) -> Result<Vec<SocketAddr>, GuardError> {
+    pub(crate) async fn resolve_url(&self, url: &Url) -> Result<Vec<SocketAddr>, GuardError> {
         self.check_url(url)?;
         let port = url.port_or_known_default().ok_or(DnsFailure)?;
         let mut addrs = match url.host() {

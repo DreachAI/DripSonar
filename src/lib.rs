@@ -1,6 +1,7 @@
 //! DripSonar: a self-hosted scrape and search engine with Firecrawl-compatible endpoints.
 
 pub mod api;
+pub mod browser;
 pub mod config;
 pub mod crawl;
 pub mod document;
@@ -42,6 +43,14 @@ pub(crate) mod testkit {
             per_host_spacing_ms: 0,
             max_timeout_ms: 120_000,
             default_max_age_ms: 86_400_000,
+            chrome_path: None,
+            chrome_ws: None,
+            browser_tabs: 4,
+            browser_memory_mb: 2048,
+            browser_recycle_pages: 200,
+            browser_sessions: 2,
+            forward_proxy_port: 3003,
+            public_url: None,
         };
         let loopback = "127.0.0.1".parse().unwrap();
         let private = "10.0.0.1".parse().unwrap();

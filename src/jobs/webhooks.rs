@@ -102,6 +102,7 @@ impl Webhook {
                     | "connection"
                     | "content-type"
                     | "x-sonar-signature"
+                    | "x-firecrawl-signature"
             ) {
                 return Err(format!("webhook.headers.{name} is not allowed"));
             }
@@ -131,6 +132,10 @@ async fn send(inner: &Inner, delivery: &Delivery) -> bool {
             .map(|byte| format!("{byte:02x}"))
             .collect();
         headers.push(("X-Sonar-Signature".into(), format!("sha256={signature}")));
+        headers.push((
+            "X-Firecrawl-Signature".into(),
+            format!("sha256={signature}"),
+        ));
     }
     matches!(
         inner

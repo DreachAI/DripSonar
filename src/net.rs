@@ -8,6 +8,7 @@ use std::{io, sync::Arc, time::Duration};
 
 use bytes::BytesMut;
 use encoding_rs::{Encoding, UTF_8};
+use tokio::sync::Semaphore;
 use tokio::time::{Instant, sleep, timeout_at};
 use url::Url;
 
@@ -98,6 +99,7 @@ pub struct Fetcher {
     routes: RouteConfig,
     guard: Arc<Guard>,
     gate: Arc<Gate>,
+    webhook_slots: Arc<Semaphore>,
 }
 
 impl Fetcher {
@@ -144,6 +146,7 @@ impl Fetcher {
             routes,
             guard,
             gate: Arc::new(Gate::new(cfg)),
+            webhook_slots: Arc::new(Semaphore::new(4)),
         })
     }
 
@@ -208,19 +211,14 @@ impl Fetcher {
             self.guard
                 .check_url(url)
                 .map_err(|refusal| FetchError::Refused(refusal.0))?;
-            let _pass = self
-                .gate
-                .enter(url.host_str().unwrap_or_default(), deadline)
-                .await?;
-            let route = self.routes.route_for(url.host_str().unwrap_or_default());
-            self.routes
-                .check_budget(route)
-                .map_err(|error| FetchError::Refused(error.to_string()))?;
-            let client = match route {
-                Route::Direct => &self.client,
-                Route::Proxy => self.proxy_client.as_ref().ok_or(FetchError::Protocol)?,
-            };
-            let mut request = client
+            let _permit = self
+                .webhook_slots
+                .acquire()
+                .await
+                .map_err(|_| FetchError::Protocol)?;
+            let route = Route::Direct;
+            let mut request = self
+                .client
                 .post(url.clone())
                 .timeout(deadline.saturating_duration_since(Instant::now()))
                 .header(reqwest::header::CONTENT_TYPE, "application/json");
@@ -296,11 +294,7 @@ impl Fetcher {
             match request.send().await {
                 Ok(response) => {
                     let retry_after = retry_after(&response);
-                    if matches!(response.status().as_u16(), 429 | 503)
-                        || response
-                            .headers()
-                            .contains_key(reqwest::header::RETRY_AFTER)
-                    {
+                    if matches!(response.status().as_u16(), 429 | 503) {
                         self.gate.penalize(host, retry_after);
                     } else if response.status().is_success() {
                         self.gate.reward(host);
@@ -309,6 +303,7 @@ impl Fetcher {
                         && matches!(response.status().as_u16(), 429 | 503)
                         && let Some(wait) = retry_after
                         && wait < deadline.saturating_duration_since(Instant::now())
+                        && self.gate.next_start(host) < deadline
                     {
                         retried_status = true;
                         drop((response, pass));

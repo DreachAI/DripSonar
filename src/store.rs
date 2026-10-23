@@ -313,8 +313,8 @@ impl Store {
         .await
     }
 
-    /// Newest successful capture of either URL, strictly before the current capture. Using the
-    /// stored time and ID also excludes captures written by concurrent, later scrapes.
+    /// Newest successful capture under this capture's own HTTP or browser key, strictly before
+    /// it. Action keys are unique per visit, so action captures never become a baseline.
     pub async fn previous_capture(
         &self,
         current: i64,
@@ -330,10 +330,7 @@ impl Store {
             let mut stmt = conn.prepare(&format!(
                 "SELECT {CAPTURE_COLUMNS} FROM captures WHERE status BETWEEN 200 AND 299
                  AND (fetched_at_ms,id) < (SELECT fetched_at_ms,id FROM captures WHERE id=COALESCE(?2,?1))
-                 AND (requested_url IN (SELECT requested_url FROM captures WHERE id=?1
-                      UNION SELECT final_url FROM captures WHERE id=?1)
-                   OR final_url IN (SELECT requested_url FROM captures WHERE id=?1
-                      UNION SELECT final_url FROM captures WHERE id=?1))
+                 AND cache_key = (SELECT cache_key FROM captures WHERE id=?1)
                  AND NOT EXISTS(SELECT 1 FROM searches WHERE capture_id=captures.id)
                  ORDER BY fetched_at_ms DESC,id DESC LIMIT 64"
             ))?;

@@ -425,7 +425,12 @@ async fn search(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
             let scrape = !formats.is_empty();
             async move {
                 let mut item = hit.as_object().cloned().unwrap_or_default();
-                item.insert("position".into(), json!(index + 1));
+                if news {
+                    let snippet = item.remove("description").unwrap_or_else(|| json!(""));
+                    item.insert("snippet".into(), snippet);
+                } else {
+                    item.insert("position".into(), json!(index + 1));
+                }
                 if scrape && let Some(url) = hit["url"].as_str() {
                     match scrape_document(state, opts, shot, url, Some(deadline)).await {
                         Ok(doc) => item.extend(doc),
@@ -445,8 +450,14 @@ async fn search(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
         .await;
     let source = if news { "news" } else { "web" };
     let mut result = json!({"success": true, "data": {source: data}});
-    if result["data"][source].as_array().is_some_and(Vec::is_empty) {
-        result["warning"] = json!("No search results found");
+    let mut warning = response["warning"].as_str().map(str::to_owned);
+    if result["data"][source].as_array().is_some_and(Vec::is_empty)
+        && !response["data"].as_array().is_some_and(Vec::is_empty)
+    {
+        extract::append_warning(&mut warning, "No search results found");
+    }
+    if let Some(warning) = warning {
+        result["warning"] = json!(warning);
     }
     Ok(Json(result))
 }

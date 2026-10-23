@@ -226,17 +226,22 @@ impl AppState {
         deadline: Instant,
     ) -> Result<Map<String, Value>, ApiError> {
         let mut data = document_json(doc, formats, source_url);
+        let mut warning = doc.warning.clone();
         if formats.contains(&Format::ChangeTracking) {
             let (mut request, _) = self.plan(opts, formats)?;
             request.deadline = deadline;
             let options = opts.change_tracking_options.clone().unwrap_or_default();
-            data.insert(
-                "changeTracking".into(),
-                self.scraper.track_changes(doc, &request, &options).await?,
-            );
+            match self.scraper.track_changes(doc, &request, &options).await {
+                Ok(tracking) => {
+                    data.insert("changeTracking".into(), tracking);
+                }
+                Err(error) => {
+                    data.insert("changeTracking".into(), Value::Null);
+                    extract::append_warning(&mut warning, &format!("Comparing failed: {error}"));
+                }
+            }
         }
         let mut usage = Usage::default();
-        let mut warning = doc.warning.clone();
         let css = opts
             .json_options
             .as_ref()
@@ -578,18 +583,26 @@ async fn search(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
     let lang = body.lang.as_deref().unwrap_or("en");
     let filters = crate::search::SearchFilters::parse(body.tbs.as_deref(), &body.sources)
         .map_err(ApiError::bad_request)?;
+    let reply = |data: Value, message: Option<&str>| {
+        let mut warning = message.map(str::to_owned);
+        if let Some(message) = filters.warning() {
+            extract::append_warning(&mut warning, message);
+        }
+        let mut response = json!({"success": true, "data": data});
+        if let Some(warning) = warning {
+            response["warning"] = json!(warning);
+        }
+        Json(response)
+    };
     let hits = state
         .searcher
         .search_filtered(&body.query, limit, lang, deadline, filters)
         .await?;
     if hits.is_empty() {
-        let warning = "No search results found";
-        return Ok(Json(
-            json!({"success": true, "data": [], "warning": warning}),
-        ));
+        return Ok(reply(json!([]), Some("No search results found")));
     }
     if formats.is_empty() {
-        return Ok(Json(json!({"success": true, "data": hits})));
+        return Ok(reply(json!(hits), None));
     }
     state.ensure_storage().await?;
     let docs: Vec<Map<String, Value>> = futures::stream::iter(hits)
@@ -625,12 +638,12 @@ async fn search(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
         .cloned()
         .collect();
     if with_content.is_empty() {
-        let warning = "No content found in search results";
-        return Ok(Json(
-            json!({"success": true, "data": docs, "warning": warning}),
+        return Ok(reply(
+            json!(docs),
+            Some("No content found in search results"),
         ));
     }
-    Ok(Json(json!({"success": true, "data": with_content})))
+    Ok(reply(json!(with_content), None))
 }
 
 /// context.dev scrape: a failed page is still HTTP 200, reported inside `markdown`.

@@ -408,7 +408,7 @@ impl Scraper {
         Ok((fetched, id, Served::Fetched))
     }
 
-    /// At most one proxy fetch and one browser visit; actions never enter this path.
+    /// One proxy recovery and one shared browser recovery; stored challenges are cache misses.
     async fn recover(
         &self,
         url: &Url,
@@ -419,7 +419,6 @@ impl Scraper {
         let mut recovery = Vec::new();
         let mut latest = original.map(|prepared| prepared.doc);
         let mut request = req.clone();
-        request.max_age = Duration::ZERO;
         let headers: Vec<_> = headers
             .iter()
             .filter(|(name, _)| !VALIDATORS.contains(&name.as_str()))
@@ -429,13 +428,28 @@ impl Scraper {
             recovery.push("proxy");
             request.proxy = ProxyMode::Stealth;
             let retried = timeout_at(req.deadline, async {
-                let (fetched, id, _) = self
-                    .fetch_http(url, &headers, &request, Some(Route::Proxy))
-                    .await?;
-                render_stored(fetched, id, &request, false, self.browser.is_enabled()).await
+                loop {
+                    let (fetched, id, served) = self
+                        .fetch_http(url, &headers, &request, Some(Route::Proxy))
+                        .await?;
+                    match render_stored(
+                        fetched,
+                        id,
+                        &request,
+                        served != Served::Fetched,
+                        self.browser.is_enabled(),
+                    )
+                    .await
+                    {
+                        Err(ScrapeError::Blocked) if served != Served::Fetched => {
+                            request.max_age = Duration::ZERO;
+                        }
+                        result => break result,
+                    }
+                }
             })
             .await
-            .map_err(|_| FetchError::Timeout)?;
+            .unwrap_or(Err(FetchError::Timeout.into()));
             match retried {
                 Ok(prepared) => {
                     let blocked = matches!(prepared.doc.status, 401 | 403 | 429);
@@ -444,26 +458,27 @@ impl Scraper {
                         return recovered(latest, &recovery);
                     }
                 }
+                Err(ScrapeError::Fetch(FetchError::Timeout)) if Instant::now() < req.deadline => {}
                 Err(error @ (ScrapeError::Storage | ScrapeError::Fetch(FetchError::Timeout))) => {
                     return Err(error);
                 }
-                Err(ScrapeError::Blocked) => latest = Err(ScrapeError::Blocked),
                 Err(_) => {}
             }
         }
-        if self.browser.is_enabled() {
+        request.max_age = req.max_age;
+        if self.browser.is_enabled() && Instant::now() < req.deadline {
             recovery.push("browser");
-            match self
-                .render_explicit(url, &headers, &request, &BrowserPlan::default())
-                .await
-            {
-                Ok(doc) => latest = Ok(doc),
+            match self.render_shared(url, &headers, &request).await {
+                Ok(prepared) => latest = Ok(prepared.doc),
+                Err(
+                    ScrapeError::Fetch(FetchError::Timeout)
+                    | ScrapeError::Browser(BrowserError::Fetch(FetchError::Timeout)),
+                ) if Instant::now() < req.deadline => {}
                 Err(
                     error @ (ScrapeError::Storage
                     | ScrapeError::Fetch(FetchError::Timeout)
                     | ScrapeError::Browser(BrowserError::Fetch(FetchError::Timeout))),
                 ) => return Err(error),
-                Err(ScrapeError::Blocked) => latest = Err(ScrapeError::Blocked),
                 Err(_) => {}
             }
         }
@@ -522,13 +537,36 @@ impl Scraper {
         http_visible: Option<usize>,
     ) -> Result<Option<Document>, ScrapeError> {
         let origin = url.origin().ascii_serialization();
+        let prepared = match self.render_shared(url, headers, req).await {
+            Ok(capture) => capture,
+            Err(ScrapeError::Storage) => return Err(ScrapeError::Storage),
+            _ => {
+                self.browser.forget(&origin);
+                return Ok(None);
+            }
+        };
+        if !policy::improves(http_visible.unwrap_or(0), prepared.visible) {
+            self.browser.forget(&origin);
+            return Ok(None);
+        }
+        self.browser.remember(&origin);
+        Ok(Some(prepared.doc))
+    }
+
+    /// Automatic visits and block recovery share the same cache and in-flight render.
+    async fn render_shared(
+        &self,
+        url: &Url,
+        headers: &[(String, String)],
+        req: &ScrapeRequest,
+    ) -> Result<Prepared, ScrapeError> {
         let key = self.browser.rendered_key_with_proxy(
             url,
             headers,
             &BrowserPlan::default(),
             req.proxy == ProxyMode::Stealth,
         );
-        let capture = timeout_at(req.deadline, async {
+        timeout_at(req.deadline, async {
             if !req.max_age.is_zero()
                 && let Ok(Some(capture)) = self.store.cached_capture(&key, req.max_age).await
             {
@@ -564,21 +602,8 @@ impl Scraper {
                 .map_err(ScrapeError::from)?;
             render_stored(fetched, id, req, false, true).await
         })
-        .await;
-        let prepared = match capture {
-            Ok(Ok(capture)) => capture,
-            Ok(Err(ScrapeError::Storage)) => return Err(ScrapeError::Storage),
-            _ => {
-                self.browser.forget(&origin);
-                return Ok(None);
-            }
-        };
-        if !policy::improves(http_visible.unwrap_or(0), prepared.visible) {
-            self.browser.forget(&origin);
-            return Ok(None);
-        }
-        self.browser.remember(&origin);
-        Ok(Some(prepared.doc))
+        .await
+        .map_err(|_| FetchError::Timeout)?
     }
 }
 

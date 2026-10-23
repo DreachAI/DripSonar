@@ -32,8 +32,13 @@ impl Scraper {
                 .map_err(|_| FetchError::Timeout)?
                 .map_err(|_| ScrapeError::Storage)?;
             let Some(previous) = previous else {
+                let status = if matches!(doc.status, 404 | 410) {
+                    "removed"
+                } else {
+                    "new"
+                };
                 return Ok(
-                    json!({"previousScrapeAt": null, "changeStatus": "new", "visibility": "visible"}),
+                    json!({"previousScrapeAt": null, "changeStatus": status, "visibility": "visible"}),
                 );
             };
             cursor = Some(previous.id);
@@ -67,7 +72,7 @@ impl Scraper {
         };
         let mut tracking =
             json!({"previousScrapeAt": at, "changeStatus": status, "visibility": "visible"});
-        if !options.modes.is_empty() && matches!(status, "changed" | "removed") {
+        if !options.modes.is_empty() && status == "changed" {
             let text = render_blocking(req.deadline, move || {
                 Ok(similar::TextDiff::configure()
                     .algorithm(similar::Algorithm::Patience)

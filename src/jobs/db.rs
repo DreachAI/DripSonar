@@ -124,19 +124,21 @@ pub async fn active(store: &Store) -> Result<Vec<(String, u64)>, StoreError> {
 pub async fn active_crawls(store: &Store) -> Result<Vec<serde_json::Value>, StoreError> {
     store.read(|conn| {
         let mut stmt = conn.prepare(
-            "SELECT j.id,f.url,j.spec,j.request FROM jobs j JOIN frontier f ON f.id=(
+            "SELECT j.id,f.url,j.spec,j.request,j.created_ms FROM jobs j JOIN frontier f ON f.id=(
              SELECT MIN(id) FROM frontier WHERE job_id=j.id AND task='page')
              WHERE j.kind='crawl' AND j.status='scraping' ORDER BY j.created_ms,j.id")?;
         let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?, row.get::<_, String>(3)?)))?
+            row.get::<_, String>(2)?, row.get::<_, String>(3)?, row.get::<_, i64>(4)?)))?
             .collect::<Result<Vec<_>, _>>()?;
-        rows.into_iter().map(|(id, url, spec, request)| {
+        rows.into_iter().map(|(id, url, spec, request, created)| {
             let spec: JobSpec = decode(&spec)?;
             let request: serde_json::Value = decode(&request)?;
             let scope = spec.scope.ok_or(StoreError::Corrupt)?;
             let options = scope.options();
+            let created = timestamp(created)?.format(&time::format_description::well_known::Rfc3339)
+                .map_err(|_| StoreError::Corrupt)?;
             // Deliberately enumerate public fields: neither page nor webhook credentials escape.
-            Ok(serde_json::json!({"id": id, "url": url, "options": {
+            Ok(serde_json::json!({"id": id, "url": url, "created_at": created, "options": {
                 "limit": spec.limit, "maxDepth": options.max_depth,
                 "maxDiscoveryDepth": options.max_discovery_hops,
                 "includePaths": options.include_paths, "excludePaths": options.exclude_paths,
@@ -161,6 +163,7 @@ fn enqueue_webhook(
     success: bool,
     data: serde_json::Value,
     error: Option<&str>,
+    capture_id: Option<i64>,
 ) -> Result<(), StoreError> {
     let (webhook, kind): (Option<String>, String) = tx.query_row(
         "SELECT json_extract(spec,'$.webhook'),kind FROM jobs WHERE id=?1",
@@ -181,6 +184,7 @@ fn enqueue_webhook(
     };
     let event = format!("{namespace}.{event}");
     let mut payload = serde_json::json!({"success": success, "type": event, "id": id,
+        "webhookId": id, "scrapeId": capture_id.map(|id| id.to_string()),
         "data": data, "metadata": webhook.metadata});
     if let Some(error) = error {
         payload["error"] = serde_json::json!(error);
@@ -369,7 +373,7 @@ pub async fn submit(
                 "UPDATE jobs SET discovered=?2 WHERE id=?1",
                 params![id, pages],
             )?;
-            enqueue_webhook(tx, &id, "started", true, serde_json::json!([]), None)?;
+            enqueue_webhook(tx, &id, "started", true, serde_json::json!([]), None, None)?;
             finish(tx, &id, retention)?;
             Ok(Some(()))
         })
@@ -448,6 +452,7 @@ fn finish(tx: &Transaction<'_>, id: &str, retention: u64) -> Result<(), StoreErr
             status == "completed",
             serde_json::json!([]),
             None,
+            None,
         )?;
         scrub_webhook(tx, id)?;
     }
@@ -461,7 +466,13 @@ pub async fn complete(
     retention: u64,
     document_encoder: DocumentEncoder,
 ) -> Result<(), StoreError> {
-    let page_data = if work.task == Task::Page && work.spec.webhook.is_some() {
+    let page_data = if work.task == Task::Page
+        && work.spec.webhook.as_ref().is_some_and(|webhook| {
+            webhook
+                .events
+                .iter()
+                .any(|event| matches!(event, webhooks::Event::Page))
+        }) {
         out.doc
             .as_ref()
             .map(|doc| document_encoder(doc, &work.formats, work.url.as_str()))
@@ -494,7 +505,7 @@ pub async fn complete(
         if changed == 0 { return Ok(()); }
         if work.task == Task::Page {
             enqueue_webhook(tx, &work.job_id, "page", out.error.is_none(),
-                serde_json::Value::Array(page_data.into_iter().collect()), out.error.as_deref())?;
+                serde_json::Value::Array(page_data.into_iter().collect()), out.error.as_deref(), out.capture_id)?;
             if let Some(doc) = doc {
                 tx.execute("UPDATE jobs SET completed=completed+1,updated_ms=?2 WHERE id=?1",
                     params![work.job_id, now])?;
@@ -654,6 +665,7 @@ pub async fn cancel(
                 false,
                 serde_json::json!([]),
                 Some("Job cancelled"),
+                None,
             )?;
             scrub_webhook(tx, &id)?;
             Ok(Some(true))

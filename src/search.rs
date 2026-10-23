@@ -21,6 +21,10 @@ pub struct Hit {
     pub url: String,
     pub title: String,
     pub description: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub date: Option<String>,
+    #[serde(default, rename = "imageUrl", skip_serializing_if = "Option::is_none")]
+    pub image_url: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -37,6 +41,7 @@ pub enum SearchError {
 pub struct SearchFilters {
     time_range: Option<TimeRange>,
     news: bool,
+    hourly: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -67,7 +72,27 @@ impl SearchFilters {
         if news && sources.iter().any(|source| source == "web") {
             return Err("sources must select either web or news, not both".into());
         }
-        Ok(Self { time_range, news })
+        Ok(Self {
+            time_range,
+            news,
+            hourly: tbs == Some("qdr:h"),
+        })
+    }
+
+    pub fn warning(self) -> Option<&'static str> {
+        self.hourly
+            .then_some("tbs qdr:h uses day granularity; hourly filtering is unavailable")
+    }
+
+    fn tbs(self) -> &'static str {
+        match self.time_range {
+            None => "",
+            Some(TimeRange::Day) if self.hourly => "qdr:h",
+            Some(TimeRange::Day) => "qdr:d",
+            Some(TimeRange::Week) => "qdr:w",
+            Some(TimeRange::Month) => "qdr:m",
+            Some(TimeRange::Year) => "qdr:y",
+        }
     }
 }
 
@@ -95,6 +120,15 @@ fn searxng_page(body: &[u8]) -> Result<(Vec<Hit>, bool), SearchError> {
                 .and_then(|v| v.as_str())
                 .unwrap_or_default()
                 .to_owned(),
+            date: result
+                .get("publishedDate")
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
+            image_url: result
+                .get("img_src")
+                .or_else(|| result.get("thumbnail"))
+                .and_then(|v| v.as_str())
+                .map(str::to_owned),
         })
     });
     Ok((normalize(hits), has_results))
@@ -143,6 +177,8 @@ fn duckduckgo_hits(document: &Document) -> Vec<Hit> {
                 .select(".result__snippet")
                 .text()
                 .to_string(),
+            date: None,
+            image_url: None,
         })
     });
     normalize(hits)
@@ -213,6 +249,8 @@ fn marked_page(html: &str, m: &Markers) -> Result<Vec<Hit>, SearchError> {
             url: item.select(m.link).first().attr("href")?.to_string(),
             title: item.select(m.title).first().text().to_string(),
             description: item.select(m.snippet).first().text().to_string(),
+            date: None,
+            image_url: None,
         })
     });
     Ok(normalize(hits))
@@ -330,7 +368,14 @@ impl Searcher {
         .await;
         if let Some(store) = &self.store {
             for (provider, fetched, hits) in exchanges {
-                let key = sha256_hex(format!("search\n{provider}\n{lang}\n{query}").as_bytes());
+                let source = if filters.news { "news" } else { "web" };
+                let key = sha256_hex(
+                    format!(
+                        "search\n{provider}\n{lang}\n{}\n{source}\n{query}",
+                        filters.tbs()
+                    )
+                    .as_bytes(),
+                );
                 let stored = store
                     .put_search(&key, &fetched, query, provider, lang, hits.as_deref())
                     .await;

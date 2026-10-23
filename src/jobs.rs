@@ -477,12 +477,21 @@ impl Jobs {
                 let scraped = async {
                     let mut doc = self.inner.scraper.scrape(&request).await?;
                     if let Some(options) = &work.spec.change_tracking {
-                        doc.change_tracking = Some(
-                            self.inner
-                                .scraper
-                                .track_changes(&doc, &request, options)
-                                .await?,
-                        );
+                        match self
+                            .inner
+                            .scraper
+                            .track_changes(&doc, &request, options)
+                            .await
+                        {
+                            Ok(tracking) => doc.change_tracking = Some(tracking),
+                            Err(error) => {
+                                doc.change_tracking = None;
+                                crate::extract::append_warning(
+                                    &mut doc.warning,
+                                    &format!("Comparing failed: {error}"),
+                                );
+                            }
+                        }
                     }
                     Ok::<_, ScrapeError>(doc)
                 }

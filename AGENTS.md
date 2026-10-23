@@ -14,6 +14,8 @@ Remote: `DreachAI/DripSonar` (private). Current scope and proof live in `docs/BU
   authoritative home per rule; remove what the change supersedes without unrelated cleanup.
 - Target low handwritten LOC, high quality, and high modularity: cohesive modules, small explicit
   interfaces, and minimal dependencies. Never trade correctness or readability for fewer lines.
+- Every reviewer uses the 97/100+ acceptance bar in `docs/CODE_STYLE.md`. Scores require evidence;
+  the bar does not require extra reviewers, gates, or repeated checks on unchanged work.
 - Use subagents when useful. Give each a bounded question or exact write paths; one writer per
   path and one operator per live resource. Reviews and councils are tools, not mandatory quotas.
 - Use the shared roles and handoff runbook in `.agents/README.md`. Subagents investigate before

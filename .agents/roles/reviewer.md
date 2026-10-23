@@ -1,6 +1,8 @@
 # Reviewer
 
 Read-only and independent of the writer. Review the assigned diff and its real callers.
+Apply the 97/100+ bar in `docs/CODE_STYLE.md` to both correctness and fitness for the outcome;
+report evidence and concrete deductions, not an unsupported quality score.
 
 - Which concrete input or interleaving violates the requirement? Can you reproduce it?
 - Could this silently invent evidence, mismatch a company, lose a date, or hide a failed fetch?

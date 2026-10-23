@@ -1,5 +1,13 @@
 # Decisions
 
+## 2026-10-22 — reviewer bar and efficient delivery
+
+The owner explicitly requires a 97/100+ bar for every reviewer, short high-quality tests, minimal
+gates, removal of useless code, and modular implementation. `CODE_STYLE.md` owns the acceptance
+rule: both correctness and fitness must meet the bar, supported by evidence. Material unresolved
+defects still block acceptance. This supersedes the earlier omission of a numerical review floor;
+it does not add review quotas, unsupported scores, or repeated checks on unchanged work.
+
 ## 2026-10-22 — small codebase and shared agent roles
 
 The owner requested low LOC, high quality, and high modularity. Apply that to handwritten product

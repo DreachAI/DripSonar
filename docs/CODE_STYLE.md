@@ -17,6 +17,9 @@ and generated/vendor code are not product LOC; keep them separate when reporting
   with the behavior or duplication that justified growth; no arbitrary LOC gate overrides correctness.
 - Search for existing types and owners before writing. Keep modules named after their purpose;
   avoid catch-all `utils`, `helpers`, and speculative frameworks. Split at real ownership boundaries.
+- Cull code the change makes obsolete, including its unused tests, config, and documentation.
+  Before removing apparently dead code, check callers, dynamic loading, and public contracts.
+  Preserve unrelated work; no speculative compatibility layers or commented-out implementations.
 - Use maintained crates for standard protocols. Start with the smallest useful Rust package;
   split crates or services only when dependencies or execution boundaries justify it.
 - Use typed inputs, explicit units, and small error enums at boundaries. Distinguish an empty
@@ -40,8 +43,27 @@ and generated/vendor code are not product LOC; keep them separate when reporting
 - Tests prove public behavior, including refusals and partial failure. Use labeled synthetic or
   redistributable public fixtures; never present them as live observations. Inject clocks and
   transport for deterministic checks. A failing dependency is never replaced with invented data.
+- Keep tests as short as possible while preserving meaningful assertions and readable setup.
+  Prove each behavior once at the appropriate boundary; use table-driven cases where clearer.
+  Avoid implementation mirrors, duplicate suites, mock-call trivia, and test-only abstraction layers.
+- Do not spam gates. Reuse the existing check entry point; add a check only for a named failure
+  it can catch. Run the smallest relevant checks, then broaden for concrete risk. Do not rerun
+  unchanged suites or create a new script, review round, or checklist for every small edit.
 - Measure before claiming performance. Compare the same source set, output requirements, hardware,
   cache state, and concurrency; include failure rates and extraction quality alongside latency.
 
 When the first Rust package lands, provide one documented `tools/ci` entry point for the actual
 format, lint, and relevant test commands. Do not add an empty gate during the documentation phase.
+
+## Reviewer acceptance: 97/100+
+
+Every reviewer grades the assigned scope on both correctness and fitness for the requested
+outcome, including simplicity, modularity, code size, and effective tests. Each must reach 97/100
+for ACCEPT. This is a reasoned reviewer assessment, not a measured accuracy or readiness metric.
+State the scope, supporting evidence, deductions, and unverified limits; never invent a score
+to satisfy the threshold. Unresolved correctness, security, evidence-integrity, or acceptance
+defects require CHANGES_REQUIRED regardless of the total. Insufficient evidence cannot earn ACCEPT.
+
+Below the bar, identify concrete gaps, repair them, and recheck the affected findings. Do not
+repeat unchanged reviews or add ceremony to inflate confidence. A writer's self-score does not
+replace an independent review; this rule governs reviews when used, not a mandatory review quota.

@@ -63,14 +63,6 @@ fn not_found() -> ApiError {
     }
 }
 
-fn reject_extraction(formats: &[Format]) -> Result<(), ApiError> {
-    if formats.contains(&Format::Json) || formats.contains(&Format::Summary) {
-        return Err(ApiError::bad_request(
-            "json/summary formats are not supported for jobs",
-        ));
-    }
-    Ok(())
-}
 fn id(value: &str) -> Result<JobId, ApiError> {
     JobId::parse_str(value).map_err(|_| not_found())
 }
@@ -176,6 +168,7 @@ pub(super) async fn crawl_start(
     if body.scrape_options.url.is_some() {
         return Err(ApiError::bad_request("scrapeOptions.url is not supported"));
     }
+    validate_job_options(&body.scrape_options)?;
     let seed = scrape::normalize(&body.url)?;
     let scope = Scope::new(
         &seed,
@@ -204,7 +197,6 @@ pub(super) async fn crawl_start(
         None => None,
     };
     let (request, formats) = state.plan(&body.scrape_options, &[Format::Markdown])?;
-    reject_extraction(&formats)?;
     let spec = JobSpec {
         kind: JobKind::Crawl,
         scrape: ScrapeTemplate::from(&request),
@@ -268,13 +260,13 @@ pub(super) async fn batch_start(
     if opts.url.is_some() {
         return Err(ApiError::bad_request("use urls, not url, for batch scrape"));
     }
+    validate_job_options(&opts)?;
     if urls.is_empty() || urls.len() > state.job_config.max_crawl_limit as usize {
         return Err(ApiError::bad_request(
             "urls must be nonempty and within SONAR_MAX_CRAWL_LIMIT",
         ));
     }
     let (request, formats) = state.plan(&opts, &[Format::Markdown])?;
-    reject_extraction(&formats)?;
     let mut seeds = Vec::new();
     let mut invalid = Vec::new();
     for input in urls {

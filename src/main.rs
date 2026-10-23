@@ -117,6 +117,7 @@ async fn serve_until_signal(cfg: &Config, mut state: api::AppState) -> Result<()
 
 async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
     let cfg = cli.config;
+    scrape::configure_rendering(cfg.render_threads);
     match cli.command {
         Command::ExtractPdf => dripsonar::document::extract_pdf_stdio()?,
         Command::Serve => serve(&cfg, Fetcher::new(&cfg)?).await?,
@@ -164,15 +165,6 @@ async fn run(cli: Cli) -> Result<(), Box<dyn Error>> {
 #[tokio::main]
 async fn main() -> ExitCode {
     let cli = Cli::parse();
-    if matches!(cli.command, Command::ExtractPdf) {
-        return match dripsonar::document::extract_pdf_stdio() {
-            Ok(()) => ExitCode::SUCCESS,
-            Err(error) => {
-                eprintln!("{error}");
-                ExitCode::FAILURE
-            }
-        };
-    }
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .with_env_filter(

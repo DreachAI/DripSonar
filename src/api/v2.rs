@@ -216,19 +216,8 @@ async fn map(State(state): State<AppState>, body: Result<Bytes, BytesRejection>)
 }
 
 fn job_options(body: &mut Map<String, Value>) -> Result<(), ApiError> {
-    let (opts, shot) = scrape_options(body)?;
-    if shot.is_some() {
-        return Err(ApiError::bad_request(
-            "formats.screenshot is not supported for jobs",
-        ));
-    }
-    if !opts.actions.is_empty() {
-        return Err(ApiError::bad_request("actions is not supported for jobs"));
-    }
-    if opts.wait_for != 0 {
-        return Err(ApiError::bad_request("waitFor is not supported for jobs"));
-    }
-    Ok(())
+    let (opts, _) = scrape_options(body)?;
+    validate_job_options(&opts)
 }
 
 async fn crawl_start(

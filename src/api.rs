@@ -243,6 +243,28 @@ fn browser_plan(opts: &ScrapeOptions, formats: &[Format]) -> Result<BrowserPlan,
     .map_err(|error| ApiError::bad_request(error.to_string()))
 }
 
+/// Durable workers do not run browser plans or per-caller extraction.
+fn validate_job_options(opts: &ScrapeOptions) -> Result<(), ApiError> {
+    if !opts.actions.is_empty() {
+        return Err(ApiError::bad_request("actions is not supported for jobs"));
+    }
+    if opts.wait_for > 0 {
+        return Err(ApiError::bad_request("waitFor is not supported for jobs"));
+    }
+    for format in opts.formats.iter().flatten() {
+        let name = match format {
+            Format::Screenshot | Format::ScreenshotFullPage => "screenshot",
+            Format::Json => "json",
+            Format::Summary => "summary",
+            _ => continue,
+        };
+        return Err(ApiError::bad_request(format!(
+            "formats.{name} is not supported for jobs"
+        )));
+    }
+    Ok(())
+}
+
 pub fn router(state: AppState) -> Router {
     let v1 = Router::new()
         .route("/v1/scrape", post(scrape))
@@ -478,6 +500,7 @@ async fn search(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
     }
     let deadline = Instant::now() + state.timeout(body.timeout, SEARCH_TIMEOUT_MS)?;
     let (template, formats) = state.plan(&body.scrape_options, &[])?;
+    let scrape_timeout = state.timeout(body.scrape_options.timeout, SCRAPE_TIMEOUT_MS)?;
     let plan = browser_plan(&body.scrape_options, &formats)?;
     let lang = body.lang.as_deref().unwrap_or("en");
     let hits = state
@@ -497,7 +520,7 @@ async fn search(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
         .map(|hit| {
             let mut request = template.clone();
             request.url = hit.url.clone();
-            request.deadline = request.deadline.min(deadline);
+            request.deadline = (Instant::now() + scrape_timeout).min(deadline);
             let (scraper, formats, plan) = (&state.scraper, &formats, &plan);
             let (state, options) = (&state, &body.scrape_options);
             async move {

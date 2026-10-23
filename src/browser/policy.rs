@@ -9,7 +9,7 @@ use std::{
 use dom_query::Document;
 use tokio::time::Instant;
 
-use crate::{net::Fetched, page};
+use crate::net::Fetched;
 
 /// Below this many visible non-whitespace characters a page may be a script shell.
 const MIN_VISIBLE: usize = 200;
@@ -38,7 +38,7 @@ const JS_NOTICES: [&str; 7] = [
     "turn on javascript",
     "need javascript",
 ];
-const INVISIBLE: &str = "script, style, noscript, template";
+const INVISIBLE: [&str; 4] = ["script", "style", "noscript", "template"];
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum Escalation {
@@ -52,7 +52,12 @@ pub enum Escalation {
 /// Escalates only a successful HTML page with almost no visible text and a concrete shell
 /// marker: an empty app root plus external or module scripts, or a JavaScript-required
 /// notice. Challenges and error statuses never escalate.
-pub fn classify_http(fetched: &Fetched) -> Escalation {
+pub(crate) fn classify_http(
+    fetched: &Fetched,
+    text: &str,
+    doc: &Document,
+    visible: usize,
+) -> Escalation {
     let html = fetched.content_type.as_deref().is_none_or(|value| {
         let essence = value.split(';').next().unwrap_or_default().trim();
         essence.eq_ignore_ascii_case("text/html")
@@ -61,21 +66,18 @@ pub fn classify_http(fetched: &Fetched) -> Escalation {
     if !(200..300).contains(&fetched.status) || !html {
         return Escalation::Keep;
     }
-    let text = fetched.text();
     let lower = text.to_ascii_lowercase();
     let root_marker = APP_ROOT_MARKERS.iter().any(|m| lower.contains(m));
     let notice = JS_NOTICES.iter().any(|m| lower.contains(m));
-    if !(root_marker || notice) || page::is_challenge(fetched.status, &fetched.headers, &text) {
+    if !(root_marker || notice) {
         return Escalation::Keep;
     }
-    let doc = Document::from(text.as_str());
     let empty_root = root_marker
         && doc.select("script[src], script[type=module]").exists()
         && doc
             .select(APP_ROOTS)
             .iter()
             .any(|root| root.text().trim().is_empty());
-    let visible = visible_in(&doc);
     if visible < MIN_VISIBLE && (empty_root || notice) {
         Escalation::Render { visible }
     } else {
@@ -84,17 +86,20 @@ pub fn classify_http(fetched: &Fetched) -> Escalation {
 }
 
 /// Visible non-whitespace characters of the body, ignoring scripts, styles, and templates.
-pub fn visible_chars(html: &str) -> usize {
-    visible_in(&Document::from(html))
-}
-
-fn visible_in(doc: &Document) -> usize {
-    doc.select(INVISIBLE).remove();
-    doc.select("body")
-        .text()
-        .chars()
-        .filter(|c| !c.is_whitespace())
-        .count()
+pub(crate) fn visible_chars(doc: &Document) -> usize {
+    let mut nodes = doc.select("body").nodes().to_vec();
+    let mut visible = 0;
+    while let Some(node) = nodes.pop() {
+        if node.is_text() {
+            visible += node.text().chars().filter(|c| !c.is_whitespace()).count();
+        } else if !node
+            .node_name()
+            .is_some_and(|name| INVISIBLE.contains(&name.as_ref()))
+        {
+            nodes.extend(node.children_it(false));
+        }
+    }
+    visible
 }
 
 /// A render helped when it shows real text and at least twice what plain HTTP showed.

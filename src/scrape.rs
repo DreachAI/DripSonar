@@ -2,13 +2,14 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Mutex, PoisonError},
+    sync::{Arc, Mutex, OnceLock, PoisonError},
     time::Duration,
 };
 
 use futures::future::{BoxFuture, FutureExt, Shared};
 use reqwest::header::{HeaderName, HeaderValue};
 use time::OffsetDateTime;
+use tokio::sync::Semaphore;
 use tokio::time::{Instant, timeout_at};
 use url::Url;
 
@@ -26,6 +27,13 @@ use crate::{
 
 /// Firecrawl's default scrape timeout.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
+
+static RENDER_SLOTS: OnceLock<Semaphore> = OnceLock::new();
+
+/// Set the process-wide CPU budget before rendering starts, including CLI exports.
+pub fn configure_rendering(threads: usize) {
+    RENDER_SLOTS.get_or_init(|| Semaphore::new(threads.clamp(1, Semaphore::MAX_PERMITS)));
+}
 
 #[derive(Clone, Debug)]
 pub struct ScrapeRequest {
@@ -209,6 +217,7 @@ pub struct Scraper {
 
 impl Scraper {
     pub fn new(fetcher: Fetcher, store: Store, cfg: &Config) -> Self {
+        configure_rendering(cfg.render_threads);
         Self {
             fetcher,
             store,
@@ -239,7 +248,7 @@ impl Scraper {
         plan: &BrowserPlan,
     ) -> Result<Document, ScrapeError> {
         let url = normalize(&req.url)?;
-        let headers = request_headers(&req.headers)?;
+        let mut headers = request_headers(&req.headers)?;
         if plan.is_explicit() {
             return self.render_explicit(&url, &headers, req, plan).await;
         }
@@ -251,16 +260,38 @@ impl Scraper {
         }
         // This caller's deadline bounds its cache reads and its wait on a shared fetch; the
         // fetch itself carries on for other waiters.
-        let (fetched, id, served) = timeout_at(req.deadline, self.fetch_http(&url, &headers, req))
+        let mut request = req.clone();
+        let mut refetched = false;
+        let (prepared, served) = loop {
+            let (fetched, id, served) =
+                timeout_at(req.deadline, self.fetch_http(&url, &headers, &request))
+                    .await
+                    .map_err(|_| FetchError::Timeout)??;
+            match render_stored(
+                fetched,
+                id,
+                req,
+                served != Served::Fetched,
+                self.browser.is_enabled(),
+            )
             .await
-            .map_err(|_| FetchError::Timeout)??;
+            {
+                Err(ScrapeError::Blocked) if served != Served::Fetched && !refetched => {
+                    // A stored challenge is a cache miss, including a 304's prior capture.
+                    refetched = true;
+                    request.max_age = Duration::ZERO;
+                    headers.retain(|(name, _)| !VALIDATORS.contains(&name.as_str()));
+                }
+                result => break (result?, served),
+            }
+        };
         if self.browser.is_enabled()
-            && let Escalation::Render { visible } = policy::classify_http(&fetched)
+            && let Escalation::Render { visible } = prepared.escalation
             && let Some(doc) = self.render_auto(&url, &headers, req, Some(visible)).await?
         {
             return Ok(doc);
         }
-        let mut doc = render_stored(fetched, id, req, served != Served::Fetched).await?;
+        let mut doc = prepared.doc;
         if served == Served::NotModified {
             let extra = &mut doc.rendered.metadata.extra;
             extra.insert("notModified".into(), true.into());
@@ -284,6 +315,13 @@ impl Scraper {
         if capture.0.status != 304 {
             return Ok(capture);
         }
+        if !headers
+            .iter()
+            .any(|(name, _)| VALIDATORS.contains(&name.as_str()))
+        {
+            // A 304 to an unconditional request is a protocol violation, never a cache hit.
+            return Err(FetchError::Protocol.into());
+        }
         match self.store.cached_capture(&key, Duration::MAX).await {
             Ok(Some(prior)) => return Ok((prior.fetched, prior.id, Served::NotModified)),
             Ok(None) => {}
@@ -294,10 +332,6 @@ impl Scraper {
             .filter(|(name, _)| !VALIDATORS.contains(&name.as_str()))
             .cloned()
             .collect();
-        if plain.len() == headers.len() {
-            // A 304 to an unconditional request is a protocol violation, never an empty page.
-            return Err(FetchError::Protocol.into());
-        }
         let key = http_key(url, &plain);
         let capture = self.cached_or_fetched(key, url, &plain, req).await?;
         if capture.0.status == 304 {
@@ -359,7 +393,9 @@ impl Scraper {
             .await
             .map_err(|_| FetchError::Timeout)?
             .map_err(not_stored)?;
-        let mut doc = render_stored(output.capture, id, req, false).await?;
+        let mut doc = render_stored(output.capture, id, req, false, false)
+            .await?
+            .doc;
         doc.browser = output.extras;
         Ok(doc)
     }
@@ -383,7 +419,11 @@ impl Scraper {
             if !req.max_age.is_zero()
                 && let Ok(Some(capture)) = self.store.cached_capture(&key, req.max_age).await
             {
-                return Ok((capture.fetched, capture.id, true));
+                match render_stored(capture.fetched, capture.id, req, true, true).await {
+                    Ok(prepared) => return Ok(prepared),
+                    Err(ScrapeError::Blocked) => {}
+                    Err(error) => return Err(error),
+                }
             }
             let (browser, store, flight_key) =
                 (self.browser.clone(), self.store.clone(), key.clone());
@@ -399,33 +439,26 @@ impl Scraper {
                     .map_err(not_stored)?;
                 Ok((output.capture, id))
             };
-            let (fetched, id) = share(&self.rendering, key.clone(), work).await?;
-            Ok((fetched, id, false))
+            let (fetched, id) = share(&self.rendering, key.clone(), work)
+                .await
+                .map_err(ScrapeError::from)?;
+            render_stored(fetched, id, req, false, true).await
         })
         .await;
-        let (fetched, id, hit) = match capture {
+        let prepared = match capture {
             Ok(Ok(capture)) => capture,
-            Ok(Err(FlightError::Storage)) => return Err(ScrapeError::Storage),
+            Ok(Err(ScrapeError::Storage)) => return Err(ScrapeError::Storage),
             _ => {
                 self.browser.forget(&origin);
                 return Ok(None);
             }
         };
-        let visible = policy::visible_chars(&fetched.text());
-        if !policy::improves(http_visible.unwrap_or(0), visible) {
+        if !policy::improves(http_visible.unwrap_or(0), prepared.visible) {
             self.browser.forget(&origin);
             return Ok(None);
         }
-        match render_stored(fetched, id, req, hit).await {
-            Ok(doc) => {
-                self.browser.remember(&origin);
-                Ok(Some(doc))
-            }
-            Err(_) => {
-                self.browser.forget(&origin);
-                Ok(None)
-            }
-        }
+        self.browser.remember(&origin);
+        Ok(Some(prepared.doc))
     }
 }
 
@@ -523,10 +556,11 @@ async fn render_stored(
     id: i64,
     req: &ScrapeRequest,
     hit: bool,
-) -> Result<Document, ScrapeError> {
-    let mut doc = render_capture(fetched, req, hit).await?;
-    doc.capture_id = Some(id);
-    Ok(doc)
+    inspect: bool,
+) -> Result<Prepared, ScrapeError> {
+    let mut prepared = prepare_capture(fetched, req, hit, inspect).await?;
+    prepared.doc.capture_id = Some(id);
+    Ok(prepared)
 }
 
 pub async fn render_capture(
@@ -534,6 +568,74 @@ pub async fn render_capture(
     req: &ScrapeRequest,
     hit: bool,
 ) -> Result<Document, ScrapeError> {
+    Ok(prepare_capture(fetched, req, hit, false).await?.doc)
+}
+
+struct Prepared {
+    doc: Document,
+    escalation: Escalation,
+    visible: usize,
+}
+
+enum ParsedCapture {
+    Page(Prepared),
+    Pdf(Document, bytes::Bytes),
+}
+
+async fn prepare_capture(
+    fetched: Fetched,
+    req: &ScrapeRequest,
+    hit: bool,
+    inspect: bool,
+) -> Result<Prepared, ScrapeError> {
+    let request = req.clone();
+    let parsed = timeout_at(req.deadline, async {
+        let slots =
+            RENDER_SLOTS.get_or_init(|| Semaphore::new(crate::config::default_render_threads()));
+        let permit = slots.acquire().await.map_err(|_| FetchError::Protocol)?;
+        tokio::task::spawn_blocking(move || {
+            // Cancellation cannot stop a running parser; it must keep its CPU slot until done.
+            let _permit = permit;
+            if Instant::now() >= request.deadline {
+                return Err(FetchError::Timeout.into());
+            }
+            parse_capture(fetched, &request, hit, inspect)
+        })
+        .await
+        .map_err(|_| ScrapeError::Fetch(FetchError::Protocol))?
+    })
+    .await
+    .map_err(|_| FetchError::Timeout)??;
+    match parsed {
+        ParsedCapture::Page(prepared) => Ok(prepared),
+        ParsedCapture::Pdf(mut doc, body) => {
+            if req.render.skip_pdf_parsing {
+                doc.rendered.markdown = req.render.markdown.then(String::new);
+                doc.warning = Some("PDF parsing disabled".to_owned());
+            } else {
+                let pdf = document::pdf_to_markdown(&body, req.deadline).await?;
+                doc.rendered.markdown = req.render.markdown.then_some(pdf.markdown);
+                doc.rendered.metadata.title = pdf.title;
+                doc.rendered
+                    .metadata
+                    .extra
+                    .insert("numPages".into(), pdf.pages.into());
+            }
+            Ok(Prepared {
+                doc,
+                escalation: Escalation::Keep,
+                visible: 0,
+            })
+        }
+    }
+}
+
+fn parse_capture(
+    fetched: Fetched,
+    req: &ScrapeRequest,
+    hit: bool,
+    inspect: bool,
+) -> Result<ParsedCapture, ScrapeError> {
     let blob_sha256 = Some(store::sha256_hex(&fetched.body));
     let mime = fetched.content_type.as_deref().map(|value| {
         let essence = value.split_once(';').map_or(value, |(essence, _)| essence);
@@ -548,38 +650,40 @@ pub async fn render_capture(
                 .ends_with(".pdf"))
         || fetched.body.starts_with(b"%PDF-")
     {
-        let (mut rendered, mut warning) = (Rendered::default(), None);
-        if req.render.skip_pdf_parsing {
-            rendered.markdown = req.render.markdown.then(String::new);
-            warning = Some("PDF parsing disabled".to_owned());
-        } else {
-            let pdf = document::pdf_to_markdown(&fetched.body, req.deadline).await?;
-            rendered.markdown = req.render.markdown.then_some(pdf.markdown);
-            rendered.metadata.title = pdf.title;
-            let pages = pdf.pages.into();
-            rendered.metadata.extra.insert("numPages".into(), pages);
-        }
-        return Ok(Document {
-            capture_id: None,
-            blob_sha256,
-            route: fetched.route,
-            url: fetched.final_url,
-            status: fetched.status,
-            content_type: Some("application/pdf".into()),
-            cached_at: hit.then_some(fetched.fetched_at),
-            rendered,
-            raw_html: None,
-            warning,
-            browser: BrowserExtras::default(),
-        });
+        return Ok(ParsedCapture::Pdf(
+            Document {
+                capture_id: None,
+                blob_sha256,
+                route: fetched.route,
+                url: fetched.final_url,
+                status: fetched.status,
+                content_type: Some("application/pdf".into()),
+                cached_at: hit.then_some(fetched.fetched_at),
+                rendered: Rendered::default(),
+                raw_html: None,
+                warning: None,
+                browser: BrowserExtras::default(),
+            },
+            fetched.body,
+        ));
     }
     let text = fetched.text();
     if page::is_challenge(fetched.status, &fetched.headers, &text) {
         return Err(ScrapeError::Blocked);
     }
+    let (mut escalation, mut visible) = (Escalation::Keep, 0);
     let rendered = match mime.as_deref() {
         None | Some("text/html" | "application/xhtml+xml") => {
-            page::render(&text, &fetched.final_url, &req.render)
+            let parsed = page::parse(&text);
+            if inspect {
+                // Decoding can exceed the render cap; classification historically sees all text.
+                let full = (text.len() > page::MAX_INPUT_BYTES)
+                    .then(|| dom_query::Document::from(text.as_str()));
+                let inspected = full.as_ref().unwrap_or(&parsed);
+                visible = policy::visible_chars(inspected);
+                escalation = policy::classify_http(&fetched, &text, inspected, visible);
+            }
+            page::render_document(parsed, &fetched.final_url, &req.render)
         }
         Some(m) if m.starts_with("text/") || m == "application/json" || m.ends_with("+json") => {
             Rendered {
@@ -589,17 +693,21 @@ pub async fn render_capture(
         }
         Some(m) => return Err(ScrapeError::Unsupported(m.to_owned())),
     };
-    Ok(Document {
-        capture_id: None,
-        blob_sha256,
-        route: fetched.route,
-        url: fetched.final_url,
-        status: fetched.status,
-        content_type: fetched.content_type,
-        cached_at: hit.then_some(fetched.fetched_at),
-        rendered,
-        raw_html: req.raw_html.then_some(text),
-        warning: None,
-        browser: BrowserExtras::default(),
-    })
+    Ok(ParsedCapture::Page(Prepared {
+        doc: Document {
+            capture_id: None,
+            blob_sha256,
+            route: fetched.route,
+            url: fetched.final_url,
+            status: fetched.status,
+            content_type: fetched.content_type,
+            cached_at: hit.then_some(fetched.fetched_at),
+            rendered,
+            raw_html: req.raw_html.then_some(text),
+            warning: None,
+            browser: BrowserExtras::default(),
+        },
+        escalation,
+        visible,
+    }))
 }

@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, HashSet};
 use dom_query::{Document, Selection};
 use url::Url;
 
-const MAX_INPUT_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_INPUT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_EXTRA_ENTRIES: usize = 100;
 const MAX_EXTRA_CHARS: usize = 1000;
 const SMALL_BODY_BYTES: usize = 20 * 1024;
@@ -81,8 +81,14 @@ pub struct Rendered {
 }
 
 pub fn render(html: &str, base_url: &Url, opts: &RenderOptions) -> Rendered {
-    let html = truncate(html, MAX_INPUT_BYTES);
-    let doc = Document::from(html);
+    render_document(parse(html), base_url, opts)
+}
+
+pub(crate) fn parse(html: &str) -> Document {
+    Document::from(truncate(html, MAX_INPUT_BYTES))
+}
+
+pub(crate) fn render_document(doc: Document, base_url: &Url, opts: &RenderOptions) -> Rendered {
     let base = doc
         .try_select("base[href]")
         .and_then(|b| b.attr("href"))
@@ -92,16 +98,34 @@ pub fn render(html: &str, base_url: &Url, opts: &RenderOptions) -> Rendered {
     let links = opts.links.then(|| links(&doc, &base));
 
     doc.select(STRIP_TAGS).remove();
-    let inner = doc
-        .try_select("body")
-        .map(|b| b.inner_html().to_string())
-        .unwrap_or_default();
-    let mut body = selected(&inner, opts, opts.only_main_content);
+    // Selection used to reparse the body in a fresh wrapper; keep that selector scope.
+    doc.select("head")
+        .nodes()
+        .iter()
+        .for_each(|n| n.remove_children());
+    for node in doc.select("html, head, body").nodes() {
+        node.remove_all_attrs();
+    }
+    if !opts.include_tags.is_empty() {
+        included(&doc, &opts.include_tags);
+    }
+    for selector in &opts.exclude_tags {
+        remove_matches(&doc, selector, false);
+    }
+    let full = opts
+        .only_main_content
+        .then(|| doc.select("body").inner_html().to_string());
+    if opts.only_main_content {
+        remove_matches(&doc, NON_MAIN, true);
+    }
+    let mut body = doc;
     // Some sites wrap all their text in a non-main class; an empty page helps nobody.
-    if opts.only_main_content && !has_text(&body) {
-        let full = selected(&inner, opts, false);
-        if has_text(&full) {
-            body = full;
+    if !has_text(&body)
+        && let Some(full) = full
+    {
+        let fallback = Document::from(format!("<body>{full}</body>"));
+        if has_text(&fallback) {
+            body = fallback;
         }
     }
     fix_images(&body, opts.remove_base64_images);
@@ -162,49 +186,46 @@ fn truncate(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-/// The body after `includeTags`, `excludeTags`, and, when `main_only`, the non-main filter.
-fn selected(inner: &str, opts: &RenderOptions, main_only: bool) -> Document {
-    let body = if opts.include_tags.is_empty() {
-        Document::from(format!("<body>{inner}</body>"))
-    } else {
-        included(inner, &opts.include_tags)
-    };
-    for sel in &opts.exclude_tags {
-        remove_matches(&body, sel, false);
-    }
-    if main_only {
-        remove_matches(&body, NON_MAIN, true);
-    }
-    body
-}
-
 fn has_text(body: &Document) -> bool {
     !body.select("body").text().trim().is_empty()
 }
 
 /// Keeps only the outermost elements matching any include selector, in document order.
-fn included(inner: &str, selectors: &[String]) -> Document {
-    let src = Document::from(format!("<body>{inner}</body>"));
-    let out = Document::from("<body></body>");
+fn included(doc: &Document, selectors: &[String]) {
     let joined = selectors
         .iter()
         .filter(|s| valid(s))
         .cloned()
         .collect::<Vec<_>>()
         .join(", ");
+    let Some(body) = doc.select("body").nodes().first().copied() else {
+        return;
+    };
     if joined.is_empty() {
-        return out;
+        body.remove_children();
+        return;
     }
-    let matches = src.select(&joined);
+    let matches = doc.select(&joined);
+    if matches.iter().any(|s| s.is("html, body")) {
+        return;
+    }
     let ids: HashSet<_> = matches.nodes().iter().map(|n| n.id).collect();
-    let mut html = String::new();
-    for n in matches.nodes() {
-        if !n.ancestors(None).iter().any(|a| ids.contains(&a.id)) {
-            html.push_str(&n.html());
-        }
+    let kept: Vec<_> = matches
+        .nodes()
+        .iter()
+        .copied()
+        .filter(|n| {
+            !Selection::from(*n).is("head")
+                && !n.ancestors(None).iter().any(|a| ids.contains(&a.id))
+        })
+        .collect();
+    for node in &kept {
+        node.remove_from_parent();
     }
-    out.select("body").set_html(html);
-    out
+    body.remove_children();
+    for node in kept {
+        body.append_child(&node);
+    }
 }
 
 fn valid(selector: &str) -> bool {

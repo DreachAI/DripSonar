@@ -2,14 +2,49 @@
 
 use std::{fmt, net::SocketAddr, path::PathBuf};
 
+#[derive(Clone)]
+pub struct Secret(String);
+
+impl std::str::FromStr for Secret {
+    type Err = std::convert::Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(Self(value.to_owned()))
+    }
+}
+
+impl std::ops::Deref for Secret {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl fmt::Display for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<redacted>")
+    }
+}
+
+impl fmt::Debug for Secret {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Display::fmt(self, f)
+    }
+}
+
+pub(crate) fn default_render_threads() -> usize {
+    std::thread::available_parallelism().map_or(1, usize::from)
+}
+
 #[derive(Clone, clap::Args)]
 pub struct Config {
     #[arg(long, env = "SONAR_BIND", default_value = "127.0.0.1:3002")]
     pub bind: SocketAddr,
     #[arg(long, env = "SONAR_DATA_DIR", default_value = "./data")]
     pub data_dir: PathBuf,
-    #[arg(long, env = "SONAR_API_KEY")]
-    pub api_key: Option<String>,
+    #[arg(long, env = "SONAR_API_KEY", hide_env_values = true)]
+    pub api_key: Option<Secret>,
     // Kept out of Config's Debug output, including the provider credential.
     #[command(flatten)]
     pub llm: crate::extract::LlmConfig,
@@ -26,7 +61,7 @@ pub struct Config {
     pub extra_ports: Vec<u16>,
     /// Upstream proxy; only SOCKS5 with locally guarded DNS is accepted.
     #[arg(long, env = "SONAR_PROXY", hide_env_values = true)]
-    pub proxy: Option<String>,
+    pub proxy: Option<Secret>,
     #[arg(long, env = "SONAR_PROXY_HOSTS", value_delimiter = ',')]
     pub proxy_hosts: Vec<String>,
     #[arg(long, env = "SONAR_PROXY_MAX_BYTES_PER_DAY")]
@@ -39,6 +74,8 @@ pub struct Config {
     pub max_body_bytes: usize,
     #[arg(long, env = "SONAR_GLOBAL_CONCURRENCY", default_value_t = 256, value_parser = at_least_one())]
     pub global_concurrency: usize,
+    #[arg(long, env = "SONAR_RENDER_THREADS", default_value_t = default_render_threads(), value_parser = clap::builder::RangedU64ValueParser::<usize>::new().range(1..=tokio::sync::Semaphore::MAX_PERMITS as u64))]
+    pub render_threads: usize,
     #[arg(long, env = "SONAR_PER_HOST_CONCURRENCY", default_value_t = 2, value_parser = at_least_one())]
     pub per_host_concurrency: usize,
     #[arg(long, env = "SONAR_PER_HOST_SPACING_MS", default_value_t = 250)]
@@ -92,11 +129,11 @@ impl fmt::Debug for Config {
         f.debug_struct("Config")
             .field("bind", &self.bind)
             .field("data_dir", &self.data_dir)
-            .field("api_key", &self.api_key.as_ref().map(|_| "<redacted>"))
+            .field("api_key", &self.api_key)
             .field("user_agent", &self.user_agent)
             .field("searxng_endpoint", &self.searxng_endpoint)
             .field("extra_ports", &self.extra_ports)
-            .field("proxy", &self.proxy.as_ref().map(|_| "<redacted>"))
+            .field("proxy", &self.proxy)
             .field("proxy_hosts", &self.proxy_hosts)
             .field("proxy_max_bytes_per_day", &self.proxy_max_bytes_per_day)
             .field("forward_proxy_concurrency", &self.forward_proxy_concurrency)
@@ -106,6 +143,7 @@ impl fmt::Debug for Config {
             )
             .field("max_body_bytes", &self.max_body_bytes)
             .field("global_concurrency", &self.global_concurrency)
+            .field("render_threads", &self.render_threads)
             .field("per_host_concurrency", &self.per_host_concurrency)
             .field("per_host_spacing_ms", &self.per_host_spacing_ms)
             .field("max_timeout_ms", &self.max_timeout_ms)

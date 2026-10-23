@@ -14,6 +14,7 @@ use url::Url;
 
 use crate::{
     config::Config,
+    document::{self, DocumentError},
     net::{FetchError, Fetched, Fetcher, Target},
     page::{self, RenderOptions, Rendered},
     store::{self, Store},
@@ -54,6 +55,8 @@ pub enum ScrapeError {
     Blocked,
     #[error("unsupported content type {0}")]
     Unsupported(String),
+    #[error(transparent)]
+    Pdf(#[from] DocumentError),
 }
 
 type SharedFetch = Shared<BoxFuture<'static, Result<Fetched, FetchError>>>;
@@ -87,7 +90,7 @@ impl Scraper {
         let key = store::sha256_hex(key_material.as_bytes());
         if !req.max_age.is_zero() {
             match self.store.cached(&key, req.max_age).await {
-                Ok(Some(capture)) => return finish(capture, req, true),
+                Ok(Some(capture)) => return finish(capture, req, true).await,
                 Ok(None) => {}
                 Err(error) => tracing::warn!(%error, "capture cache unavailable"),
             }
@@ -99,7 +102,7 @@ impl Scraper {
             max_bytes: self.max_bytes,
         };
         let fetched = self.fetch_once(key, target).await?;
-        finish(fetched, req, false)
+        finish(fetched, req, false).await
     }
 
     /// Identical concurrent misses share one fetch. It runs as its own task, so it completes
@@ -158,15 +161,43 @@ fn request_headers(headers: &[(String, String)]) -> Result<Vec<(String, String)>
     Ok(valid)
 }
 
-fn finish(fetched: Fetched, req: &ScrapeRequest, hit: bool) -> Result<Document, ScrapeError> {
-    let text = fetched.text();
-    if page::is_challenge(fetched.status, &fetched.headers, &text) {
-        return Err(ScrapeError::Blocked);
-    }
+async fn finish(fetched: Fetched, req: &ScrapeRequest, hit: bool) -> Result<Document, ScrapeError> {
     let mime = fetched.content_type.as_deref().map(|value| {
         let essence = value.split_once(';').map_or(value, |(essence, _)| essence);
         essence.trim().to_ascii_lowercase()
     });
+    if mime.as_deref() == Some("application/pdf")
+        || (mime.as_deref() == Some("application/octet-stream")
+            && fetched
+                .final_url
+                .path()
+                .to_ascii_lowercase()
+                .ends_with(".pdf"))
+        || fetched.body.starts_with(b"%PDF-")
+    {
+        let pdf = document::pdf_to_markdown(&fetched.body, req.deadline).await?;
+        let mut rendered = Rendered {
+            markdown: req.render.markdown.then_some(pdf.markdown),
+            ..Rendered::default()
+        };
+        rendered.metadata.title = pdf.title;
+        rendered
+            .metadata
+            .extra
+            .insert("numPages".into(), pdf.pages.to_string());
+        return Ok(Document {
+            url: fetched.final_url,
+            status: fetched.status,
+            content_type: Some("application/pdf".into()),
+            cached_at: hit.then_some(fetched.fetched_at),
+            rendered,
+            raw_html: None,
+        });
+    }
+    let text = fetched.text();
+    if page::is_challenge(fetched.status, &fetched.headers, &text) {
+        return Err(ScrapeError::Blocked);
+    }
     let rendered = match mime.as_deref() {
         None | Some("text/html" | "application/xhtml+xml") => {
             page::render(&text, &fetched.final_url, &req.render)

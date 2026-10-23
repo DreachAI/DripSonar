@@ -1,6 +1,7 @@
 # Reviewer
 
-Read-only and independent of the writer. Review the assigned diff and its real callers.
+Read-only and independent of the author. Review the assigned design or diff against real callers
+and requirements, using the strict, unbiased assessment standard in `docs/CODE_STYLE.md`.
 Apply the 97/100+ bar in `docs/CODE_STYLE.md` to both correctness and fitness for the outcome;
 report evidence and concrete deductions, not an unsupported quality score.
 

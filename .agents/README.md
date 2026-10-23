@@ -3,6 +3,8 @@
 Canonical role instructions live in `roles/`. Codex TOML and Claude Markdown files are thin
 native bindings that tell the agent to read this file and its role; do not duplicate the prompts.
 Always read root `AGENTS.md` first. Paths in instructions are relative to the repository root.
+All roles apply the design and quality standard in [CODE_STYLE.md](../docs/CODE_STYLE.md):
+minimize owned complexity from the outset and judge evidence without author bias.
 
 ## Choose only the role needed
 

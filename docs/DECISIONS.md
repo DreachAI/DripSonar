@@ -7,6 +7,9 @@ gates, removal of useless code, and modular implementation. `CODE_STYLE.md` owns
 rule: both correctness and fitness must meet the bar, supported by evidence. Material unresolved
 defects still block acceptance. This supersedes the earlier omission of a numerical review floor;
 it does not add review quotas, unsupported scores, or repeated checks on unchanged work.
+The owner clarified that this standard starts during design and applies throughout delivery:
+strict, unbiased assessment; minimal owned complexity; and no score inflation or performative
+harshness. Design proposals must earn their moving parts before implementation starts.
 
 ## 2026-10-22 — small codebase and shared agent roles
 

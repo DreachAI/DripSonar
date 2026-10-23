@@ -1,12 +1,17 @@
 # Code conventions
 
 Adapted from Dreach's engineering conventions; source revisions are in [DECISIONS.md](DECISIONS.md).
-These rules apply when implementation begins. They are not claims that lint or build gates exist.
+These rules apply from design through implementation and review, including tests, docs, and tooling.
+They are not claims that lint or build gates exist.
 
 The target is **low handwritten LOC, high quality, and high modularity**. Prefer the smallest
 readable implementation that satisfies the behavior and its failure cases. Reference checkouts
 and generated/vendor code are not product LOC; keep them separate when reporting code size.
 
+- Design for the smallest complete user flow. Justify each new module, dependency, service, store,
+  and public interface against a concrete need; compare deletion and reuse first. Prefer a few
+  cohesive parts over either a monolith or fragmented wrappers. Define the simplest effective
+  acceptance checks alongside the design. Routine changes do not need a separate design ceremony.
 - A module owns one reason to change and exposes the smallest useful interface. Keep dependencies
   directional; avoid cycles, public internals, pass-through layers, and one-file-per-trivial-function
   fragmentation. Add a trait, crate, plugin system, or service only for a concrete consumer or boundary.
@@ -56,6 +61,11 @@ When the first Rust package lands, provide one documented `tools/ci` entry point
 format, lint, and relevant test commands. Do not add an empty gate during the documentation phase.
 
 ## Reviewer acceptance: 97/100+
+
+Review as a strict, unbiased outsider. Judge the artifact against requirements and evidence,
+regardless of author, model, effort invested, or prior endorsement. Challenge the preferred design
+and look for disconfirming evidence. Do not inflate scores to reach the floor, excuse a defect
+because the work is nearly done, or invent findings to appear harsh. Apply the same bar to designs.
 
 Every reviewer grades the assigned scope on both correctness and fitness for the requested
 outcome, including simplicity, modularity, code size, and effective tests. Each must reach 97/100

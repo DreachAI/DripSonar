@@ -74,7 +74,7 @@ fn no_fields(object: &Map<String, Value>, field: &str) -> Result<(), ApiError> {
 fn scrape_options(
     body: &mut Map<String, Value>,
 ) -> Result<(ScrapeOptions, Option<Shot>), ApiError> {
-    reject(body, &["parsePDF"])?;
+    reject(body, &["parsePDF", "jsonOptions"])?;
     let mut shot = None;
     if let Some(formats) = take::<Vec<Value>>(body, "formats")? {
         let mut translated = Vec::new();
@@ -82,6 +82,26 @@ fn scrape_options(
             let (name, mut options) = variant(format, "formats")?;
             let format = match name.as_str() {
                 "markdown" | "html" | "rawHtml" | "links" => name,
+                "json" => {
+                    if body.contains_key("jsonOptions") {
+                        return Err(ApiError::bad_request(
+                            "formats: only one json format is allowed",
+                        ));
+                    }
+                    let schema: Option<Value> = take(&mut options, "schema")?;
+                    let prompt: Option<String> = take(&mut options, "prompt")?;
+                    no_fields(&options, "formats.json")?;
+                    let mut json_options = Map::new();
+                    if let Some(schema) = schema {
+                        json_options.insert("schema".into(), schema);
+                    }
+                    if let Some(prompt) = prompt {
+                        json_options.insert("prompt".into(), json!(prompt));
+                    }
+                    body.insert("jsonOptions".into(), Value::Object(json_options));
+                    name
+                }
+                "summary" => name,
                 "screenshot" => {
                     if shot.is_some() {
                         return Err(ApiError::bad_request(
@@ -149,7 +169,9 @@ async fn scrape_document(
     let mut plan = browser_plan(opts, &formats)?;
     plan.screenshot = shot;
     let doc = state.scraper.scrape_with(&request, &plan).await?;
-    Ok(document_json(&doc, &formats, &request.url))
+    state
+        .extracted_document(&doc, &formats, &request.url, opts)
+        .await
 }
 
 async fn scrape(State(state): State<AppState>, body: Result<Bytes, BytesRejection>) -> Reply {

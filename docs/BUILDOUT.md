@@ -15,8 +15,9 @@ These are proposed field requirements; freeze a concrete schema with the first e
 
 ## Present state
 
-Bootstrap guidance and research are present. Firecrawl is checked out as a pinned reference.
-No Cargo package, crawler, search index, adapter integration, service, or deployment exists yet.
+The Firecrawl-compatible collector is built (see [ARCHITECTURE.md](ARCHITECTURE.md)): scrape,
+search, map, crawl, batch, browser actions and sessions, PDF text, proxy routing, and export.
+Not deployed or benchmarked. The company-signal stages below build on it and have not started.
 
 ## Proposed delivery sequence
 

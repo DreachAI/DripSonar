@@ -41,9 +41,9 @@ One Cargo package, `dripsonar`: a library plus the `sonar` binary (`serve`, `scr
 | `api` | HTTP routes, both wire shapes, validation, auth, error mapping | `router(AppState) -> axum::Router` | scrape, search |
 | `main` | CLI and server lifecycle | — | api, config |
 
-Dependencies are acyclic in that order. `page` never touches the network or disk. `net::fetch` is
-the only network path and always applies the guard internally, so no caller can skip it; there is
-no proxy route yet, so no separate egress module exists until one is needed.
+Dependencies are acyclic in that order. `page` never touches the network or disk. Page collection
+uses `net::fetch` and its destination guard; structured extraction uses a separate operator-trusted
+endpoint (see Structured extraction below).
 
 ## Network rules (`net`)
 
@@ -139,7 +139,7 @@ for blocks, otherwise the Firecrawl code) with `error`.
 - Routes: `/v1/scrape`, `/v1/search`, `/v1/web/scrape`, `/v1/web/search`, `GET /health`, and the
   browser session and artifact routes (Browser tier below).
 - Request bodies deny unknown fields and are capped at 1 MiB. Fields Firecrawl accepts but this
-  engine does not implement (`json`/`extract` formats, `location`) are rejected with `BAD_REQUEST`
+  engine does not implement (`extract` format, `location`) are rejected with `BAD_REQUEST`
   naming the field rather than silently ignored; `mobile`, `blockAds`, `proxy`, and `storeInCache`
   are accepted as no-ops. `actions`, screenshot formats, and `waitFor` use the browser tier.
 - Auth: when `SONAR_API_KEY` is set, `Authorization: Bearer <key>` is required; otherwise keyless,
@@ -298,7 +298,28 @@ type leaves `browser`.
   Shared v1 no-ops remain no-ops. Jobs reject screenshots, nonempty actions, and positive waitFor
   because workers do not execute browser plans. Legacy v1-only option names are rejected.
 
-### Later
+### Structured extraction (`extract`)
 
-LLM `json`/`extract` formats through an OpenAI-compatible endpoint with a spend cap; change tracking from stored captures; then the company-signal layers in
+- As built: v1 `json` with `jsonOptions: {schema?, prompt?, systemPrompt?}` and `summary`;
+  v2 `{type:"json", schema?, prompt?}` and `{type:"summary"}`. Scrape and search share extraction;
+  crawl and batch explicitly reject these formats. Without `SONAR_LLM_URL`, requests get a named 400.
+- `SONAR_LLM_URL` is an operator-trusted OpenAI-compatible base URL, including private/loopback
+  endpoints; `SONAR_LLM_MODEL` is required and `SONAR_LLM_API_KEY` is optional and redacted.
+  A dedicated client disables proxies and redirects, bypasses the page guard, and caps replies at
+  4 MiB. No page text, prompts, or provider keys are logged.
+- Page markdown is generated even when not returned. `SONAR_LLM_MAX_INPUT_CHARS` (60000) truncates
+  at a character boundary with a warning; randomized delimiters and system instructions mark page
+  text as untrusted data. Temperature is zero; `SONAR_LLM_MAX_OUTPUT_TOKENS` defaults to 2048.
+- Schema requests use `json_schema`, falling back to `json_object` on HTTP 400/422. Local validation
+  supports primitive/nullable types, required keys, nested properties/items, boolean schemas,
+  and `additionalProperties` booleans; unsupported constraints are rejected before collection.
+  Invalid JSON or schema mismatch retries once with the validation error, then returns `json:null`
+  and a warning. Summary uses a validated string field. Failures never fail a successful page scrape.
+- `SONAR_LLM_CONCURRENCY` (4) bounds shared provider work; `SONAR_LLM_TIMEOUT_MS` (60000) covers
+  queueing, fallback, and retry for each format. Cancellation drops the request and releases its slot.
+  Reported token counts accumulate across attempts and formats in `metadata.llmUsage` without
+  inventing missing counts. Extraction is per caller, not cached or persisted. No monetary spend cap
+  is implemented; operator enablement and request/token/concurrency limits bound individual work.
+
+Change tracking from stored captures and the company-signal layers remain later work in
 [BUILDOUT.md](BUILDOUT.md).

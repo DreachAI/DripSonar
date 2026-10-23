@@ -27,6 +27,7 @@ use tracing::Instrument;
 use crate::{
     browser::{Action, BrowserError, BrowserPlan, BrowserTier, Shot},
     config::Config,
+    extract::{self, Extractor, JsonOptions, Usage},
     net::{FetchError, Fetcher},
     page::RenderOptions,
     scrape::{self, Document, ScrapeError, ScrapeRequest, Scraper},
@@ -52,6 +53,7 @@ pub struct AppState {
     max_timeout_ms: u64,
     default_max_age_ms: u64,
     browser: BrowserTier,
+    extractor: Arc<Result<Option<Extractor>, String>>,
 }
 
 impl AppState {
@@ -68,6 +70,7 @@ impl AppState {
             api_key: cfg.api_key.as_deref().map(Arc::from),
             max_timeout_ms: cfg.max_timeout_ms,
             default_max_age_ms: cfg.default_max_age_ms,
+            extractor: Arc::new(Extractor::new(&cfg.llm)),
         })
     }
 
@@ -131,6 +134,18 @@ impl AppState {
             .formats
             .clone()
             .unwrap_or_else(|| default_formats.to_vec());
+        let extraction = formats.contains(&Format::Json) || formats.contains(&Format::Summary);
+        if extraction {
+            self.extractor()?;
+        }
+        if let Some(options) = &opts.json_options {
+            if !formats.contains(&Format::Json) {
+                return Err(ApiError::bad_request(
+                    "jsonOptions requires the json format",
+                ));
+            }
+            options.validate().map_err(ApiError::bad_request)?;
+        }
         let request = ScrapeRequest {
             url: opts.url.clone().unwrap_or_default(),
             headers: opts.headers.clone().into_iter().collect(),
@@ -141,7 +156,7 @@ impl AppState {
                 include_tags: opts.include_tags.clone(),
                 exclude_tags: opts.exclude_tags.clone(),
                 remove_base64_images: opts.remove_base64_images.unwrap_or(true),
-                markdown: formats.contains(&Format::Markdown),
+                markdown: formats.contains(&Format::Markdown) || extraction,
                 html: formats.contains(&Format::Html),
                 links: formats.contains(&Format::Links),
                 skip_pdf_parsing: !opts.parse_pdf.unwrap_or(true),
@@ -149,6 +164,72 @@ impl AppState {
             raw_html: formats.contains(&Format::RawHtml),
         };
         Ok((request, formats))
+    }
+
+    fn extractor(&self) -> Result<&Extractor, ApiError> {
+        self.extractor
+            .as_ref()
+            .as_ref()
+            .map_err(|error| ApiError::bad_request(error.clone()))?
+            .as_ref()
+            .ok_or_else(|| ApiError::bad_request("json/summary formats require SONAR_LLM_URL"))
+    }
+
+    /// Extraction is per caller, never shared with the capture cache or persisted by jobs.
+    async fn extracted_document(
+        &self,
+        doc: &Document,
+        formats: &[Format],
+        source_url: &str,
+        opts: &ScrapeOptions,
+    ) -> Result<Map<String, Value>, ApiError> {
+        let mut data = document_json(doc, formats, source_url);
+        let mut usage = Usage::default();
+        let mut warning = doc.warning.clone();
+        for format in [Format::Json, Format::Summary] {
+            if !formats.contains(&format) {
+                continue;
+            }
+            let summary = JsonOptions {
+                schema: Some(
+                    json!({"type": "object", "properties": {"summary": {"type": "string"}}, "required": ["summary"], "additionalProperties": false}),
+                ),
+                prompt: Some("Summarize the page's main content concisely and accurately.".into()),
+                ..JsonOptions::default()
+            };
+            let default_options = JsonOptions::default();
+            let (name, options) = if format == Format::Summary {
+                ("summary", &summary)
+            } else {
+                (
+                    "json",
+                    opts.json_options.as_ref().unwrap_or(&default_options),
+                )
+            };
+            let result = self
+                .extractor()?
+                .run(doc.rendered.markdown.as_deref().unwrap_or(""), options)
+                .await;
+            usage.add(&result.usage);
+            if let Some(message) = result.warning {
+                extract::append_warning(&mut warning, &format!("{name}: {message}"));
+            }
+            let value = if format == Format::Summary {
+                result.value.get("summary").cloned().unwrap_or(Value::Null)
+            } else {
+                result.value
+            };
+            data.insert(name.into(), value);
+        }
+        if let Some(warning) = warning {
+            data.insert("warning".into(), json!(warning));
+        }
+        if !usage.is_empty()
+            && let Some(Value::Object(metadata)) = data.get_mut("metadata")
+        {
+            metadata.insert("llmUsage".into(), json!(usage));
+        }
+        Ok(data)
     }
 }
 
@@ -193,6 +274,8 @@ pub(crate) enum Format {
     Html,
     RawHtml,
     Links,
+    Json,
+    Summary,
     Screenshot,
     #[serde(rename = "screenshot@fullPage")]
     ScreenshotFullPage,
@@ -215,12 +298,13 @@ fn screenshot_format(formats: &[Format]) -> Result<Option<Shot>, ApiError> {
 }
 
 /// Firecrawl v1 scrape options. Unknown fields, including the known-but-unimplemented
-/// `jsonOptions`, `extract`, and `location`, are refused by name.
+/// `extract` and `location`, are refused by name.
 #[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
 struct ScrapeOptions {
     url: Option<String>,
     formats: Option<Vec<Format>>,
+    json_options: Option<JsonOptions>,
     only_main_content: Option<bool>,
     #[serde(default)]
     include_tags: Vec<String>,
@@ -375,7 +459,9 @@ async fn scrape(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
     let (request, formats) = state.plan(&opts, &[Format::Markdown])?;
     let plan = browser_plan(&opts, &formats)?;
     let doc = state.scraper.scrape_with(&request, &plan).await?;
-    let data = document_json(&doc, &formats, &request.url);
+    let data = state
+        .extracted_document(&doc, &formats, &request.url, &opts)
+        .await?;
     Ok(Json(json!({"success": true, "data": data})))
 }
 
@@ -413,20 +499,27 @@ async fn search(State(state): State<AppState>, body: Result<Bytes, BytesRejectio
             request.url = hit.url.clone();
             request.deadline = request.deadline.min(deadline);
             let (scraper, formats, plan) = (&state.scraper, &formats, &plan);
+            let (state, options) = (&state, &body.scrape_options);
             async move {
                 let mut item = hit_json(&hit);
                 match scraper.scrape_with(&request, plan).await {
-                    Ok(doc) => item.extend(document_json(&doc, formats, &hit.url)),
+                    Ok(doc) => item.extend(
+                        state
+                            .extracted_document(&doc, formats, &hit.url, options)
+                            .await?,
+                    ),
                     Err(error) => {
                         tracing::info!(code = scrape_failure(&error).1, "hit not scraped");
                     }
                 }
-                item
+                Ok::<_, ApiError>(item)
             }
         })
         .buffered(SEARCH_SCRAPE_CONCURRENCY)
-        .collect()
-        .await;
+        .collect::<Vec<_>>()
+        .await
+        .into_iter()
+        .collect::<Result<_, _>>()?;
     let with_content: Vec<_> = docs
         .iter()
         .filter(|doc| has_content(doc))
@@ -543,6 +636,8 @@ pub(crate) fn document_json(
             Format::Html => ("html", json!(rendered.html.clone().unwrap_or_default())),
             Format::RawHtml => ("rawHtml", json!(doc.raw_html.clone().unwrap_or_default())),
             Format::Links => ("links", json!(rendered.links.clone().unwrap_or_default())),
+            Format::Json => ("json", Value::Null),
+            Format::Summary => ("summary", Value::Null),
             Format::Screenshot | Format::ScreenshotFullPage => {
                 ("screenshot", json!(doc.browser.screenshot))
             }
@@ -596,11 +691,13 @@ fn hit_json(hit: &Hit) -> Map<String, Value> {
 }
 
 fn has_content(doc: &Map<String, Value>) -> bool {
-    ["markdown", "html", "rawHtml"].iter().any(|key| {
-        doc.get(*key)
-            .and_then(Value::as_str)
-            .is_some_and(|s| !s.is_empty())
-    })
+    doc.contains_key("json")
+        || doc.contains_key("summary")
+        || ["markdown", "html", "rawHtml"].iter().any(|key| {
+            doc.get(*key)
+                .and_then(Value::as_str)
+                .is_some_and(|s| !s.is_empty())
+        })
 }
 
 /// The Firecrawl error table in docs/ARCHITECTURE.md.

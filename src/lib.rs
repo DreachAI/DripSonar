@@ -7,6 +7,7 @@ pub mod crawl;
 pub mod document;
 pub mod egress;
 pub mod export;
+pub mod extract;
 pub mod jobs;
 pub mod net;
 pub mod page;
@@ -31,6 +32,7 @@ pub(crate) mod testkit {
             bind: addr,
             data_dir: std::env::temp_dir(),
             api_key: None,
+            llm: crate::extract::LlmConfig::default(),
             user_agent: "DripSonar-test".into(),
             searxng_endpoint: None,
             extra_ports: vec![addr.port()],

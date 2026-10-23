@@ -62,6 +62,15 @@ fn not_found() -> ApiError {
         message: "Job not found".into(),
     }
 }
+
+fn reject_extraction(formats: &[Format]) -> Result<(), ApiError> {
+    if formats.contains(&Format::Json) || formats.contains(&Format::Summary) {
+        return Err(ApiError::bad_request(
+            "json/summary formats are not supported for jobs",
+        ));
+    }
+    Ok(())
+}
 fn id(value: &str) -> Result<JobId, ApiError> {
     JobId::parse_str(value).map_err(|_| not_found())
 }
@@ -195,6 +204,7 @@ pub(super) async fn crawl_start(
         None => None,
     };
     let (request, formats) = state.plan(&body.scrape_options, &[Format::Markdown])?;
+    reject_extraction(&formats)?;
     let spec = JobSpec {
         kind: JobKind::Crawl,
         scrape: ScrapeTemplate::from(&request),
@@ -264,6 +274,7 @@ pub(super) async fn batch_start(
         ));
     }
     let (request, formats) = state.plan(&opts, &[Format::Markdown])?;
+    reject_extraction(&formats)?;
     let mut seeds = Vec::new();
     let mut invalid = Vec::new();
     for input in urls {

@@ -10,6 +10,9 @@ pub struct Config {
     pub data_dir: PathBuf,
     #[arg(long, env = "SONAR_API_KEY")]
     pub api_key: Option<String>,
+    // Kept out of Config's Debug output, including the provider credential.
+    #[command(flatten)]
+    pub llm: crate::extract::LlmConfig,
     #[arg(
         long,
         env = "SONAR_USER_AGENT",

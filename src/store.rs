@@ -15,7 +15,7 @@ use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 use time::OffsetDateTime;
 
-use crate::net::Fetched;
+use crate::net::{Fetched, Route};
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS captures (
@@ -28,7 +28,8 @@ CREATE TABLE IF NOT EXISTS captures (
     content_type TEXT,
     blob_sha256 TEXT NOT NULL,
     byte_len INTEGER NOT NULL,
-    fetched_at_ms INTEGER NOT NULL
+    fetched_at_ms INTEGER NOT NULL,
+    route TEXT
 );
 CREATE INDEX IF NOT EXISTS captures_by_key ON captures (cache_key, fetched_at_ms);
 ";
@@ -58,11 +59,22 @@ impl Store {
     pub fn open(dir: &Path) -> Result<Self, StoreError> {
         let blobs = dir.join("blobs").join("sha256");
         fs::create_dir_all(&blobs)?;
-        let db = Connection::open(dir.join("sonar.db"))?;
+        let mut db = Connection::open(dir.join("sonar.db"))?;
         db.pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get::<_, String>(0))?;
         db.pragma_update(None, "foreign_keys", true)?;
         db.busy_timeout(Duration::from_secs(5))?;
         db.execute_batch(SCHEMA)?;
+        // Serialize schema inspection and ALTER across simultaneous opens of an old store.
+        let tx = db.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let has_route: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pragma_table_info('captures') WHERE name = 'route')",
+            [],
+            |row| row.get(0),
+        )?;
+        if !has_route {
+            tx.execute_batch("ALTER TABLE captures ADD COLUMN route TEXT")?;
+        }
+        tx.commit()?;
         Ok(Self {
             db: Arc::new(Mutex::new(db)),
             blobs,
@@ -97,7 +109,7 @@ impl Store {
             let db = self.db.lock().unwrap_or_else(PoisonError::into_inner);
             db.query_row(
                 "SELECT requested_url, final_url, status, headers, content_type, blob_sha256,
-                        fetched_at_ms
+                        fetched_at_ms, route
                  FROM captures
                  WHERE cache_key = ?1 AND fetched_at_ms >= ?2 AND status BETWEEN 200 AND 299
                  ORDER BY fetched_at_ms DESC, id DESC LIMIT 1",
@@ -111,12 +123,13 @@ impl Store {
                         row.get::<_, Option<String>>(4)?,
                         row.get::<_, String>(5)?,
                         row.get::<_, i64>(6)?,
+                        row.get::<_, Option<String>>(7)?,
                     ))
                 },
             )
             .optional()?
         };
-        let Some((requested, final_url, status, headers, content_type, hash, fetched_at)) = row
+        let Some((requested, final_url, status, headers, content_type, hash, fetched_at, route)) = row
         else {
             return Ok(None);
         };
@@ -126,6 +139,11 @@ impl Store {
             Err(e) => return Err(e.into()),
         };
         Ok(Some(Fetched {
+            route: match route.as_deref() {
+                None | Some("direct") => Route::Direct,
+                Some("proxy") => Route::Proxy,
+                _ => return Err(StoreError::Corrupt),
+            },
             requested_url: requested.parse().map_err(|_| StoreError::Corrupt)?,
             final_url: final_url.parse().map_err(|_| StoreError::Corrupt)?,
             status,
@@ -155,8 +173,8 @@ impl Store {
         let db = self.db.lock().unwrap_or_else(PoisonError::into_inner);
         db.execute(
             "INSERT INTO captures (cache_key, requested_url, final_url, status, headers,
-                                   content_type, blob_sha256, byte_len, fetched_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                                   content_type, blob_sha256, byte_len, fetched_at_ms, route)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
             params![
                 key,
                 fetched.requested_url.as_str(),
@@ -167,6 +185,10 @@ impl Store {
                 hash,
                 i64::try_from(fetched.body.len()).map_err(|_| StoreError::Corrupt)?,
                 unix_ms(fetched.fetched_at)?,
+                match fetched.route {
+                    Route::Direct => "direct",
+                    Route::Proxy => "proxy",
+                },
             ],
         )?;
         Ok(())

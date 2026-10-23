@@ -1,7 +1,6 @@
 //! The only network path: destination guard, redirects, deadlines, byte caps, decoding.
 
 mod gate;
-mod guard;
 
 #[cfg(any(test, feature = "test-support"))]
 use std::{collections::HashMap, net::IpAddr};
@@ -12,11 +11,12 @@ use encoding_rs::{Encoding, UTF_8};
 use tokio::time::{Instant, sleep, timeout_at};
 use url::Url;
 
-use self::{
-    gate::{Gate, Pass},
-    guard::{DnsFailure, Guard, GuardedResolver, Refusal},
+use self::gate::{Gate, Pass};
+pub use crate::egress::Route;
+use crate::{
+    config::Config,
+    egress::{DnsFailure, FetchGuard as Guard, GuardedResolver, Refusal, RouteConfig},
 };
-use crate::config::Config;
 
 /// Redirects followed per fetch; one more is `TooManyRedirects`.
 const MAX_REDIRECTS: usize = 5;
@@ -30,6 +30,7 @@ pub struct Target {
 
 #[derive(Clone, Debug)]
 pub struct Fetched {
+    pub route: Route,
     pub requested_url: url::Url,
     pub final_url: url::Url,
     pub status: u16,
@@ -88,6 +89,8 @@ pub enum FetchError {
 #[derive(Clone)]
 pub struct Fetcher {
     client: reqwest::Client,
+    proxy_client: Option<reqwest::Client>,
+    routes: RouteConfig,
     guard: Arc<Guard>,
     gate: Arc<Gate>,
 }
@@ -110,18 +113,43 @@ impl Fetcher {
 
     fn build(cfg: &Config, guard: Guard) -> Result<Self, FetchError> {
         let guard = Arc::new(guard);
-        let client = reqwest::Client::builder()
-            .user_agent(cfg.user_agent.as_str())
-            .no_proxy()
-            .redirect(reqwest::redirect::Policy::none())
-            .dns_resolver(Arc::new(GuardedResolver(Arc::clone(&guard))))
-            .build()
-            .map_err(|_| FetchError::Protocol)?;
+        let routes = RouteConfig::from_config(cfg)
+            .map_err(|error| FetchError::Refused(error.to_string()))?;
+        let builder = || {
+            reqwest::Client::builder()
+                .user_agent(cfg.user_agent.as_str())
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .dns_resolver(Arc::new(GuardedResolver(Arc::clone(&guard))))
+        };
+        let client = builder().build().map_err(|_| FetchError::Protocol)?;
+        let proxy_client = routes
+            .reqwest_proxy()
+            .map_err(|error| FetchError::Refused(error.to_string()))?
+            .map(|proxy| {
+                builder()
+                    .proxy(proxy)
+                    .build()
+                    .map_err(|_| FetchError::Protocol)
+            })
+            .transpose()?;
         Ok(Self {
             client,
+            proxy_client,
+            routes,
             guard,
             gate: Arc::new(Gate::new(cfg)),
         })
+    }
+
+    /// Share the same destination policy with the browser forward proxy.
+    pub fn guard(&self) -> Arc<Guard> {
+        Arc::clone(&self.guard)
+    }
+
+    /// Cloning preserves the shared daily byte budget.
+    pub fn route_config(&self) -> RouteConfig {
+        self.routes.clone()
     }
 
     /// One guarded exchange; `target.deadline` covers queueing, redirects, retries, and body.
@@ -143,10 +171,11 @@ impl Fetcher {
             } else {
                 &[]
             };
-            let (response, pass) = self.send(&url, headers, target.deadline).await?;
+            let route = self.routes.route_for(url.host_str().unwrap_or_default());
+            let (response, pass) = self.send(&url, headers, target.deadline, route).await?;
             match redirect_location(&response) {
                 Some(location) => url = next_hop(&url, location)?,
-                None => return read(response, pass, target, url).await,
+                None => return read(response, pass, target, url, route, &self.routes).await,
             }
         }
         Err(FetchError::TooManyRedirects)
@@ -159,12 +188,20 @@ impl Fetcher {
         url: &Url,
         headers: &[(String, String)],
         deadline: Instant,
+        route: Route,
     ) -> Result<(reqwest::Response, Pass), FetchError> {
         let host = url.host_str().unwrap_or_default();
         let (mut retried_error, mut retried_status) = (false, false);
         loop {
             let pass = self.gate.enter(host, deadline).await?;
-            let mut request = self.client.get(url.clone());
+            self.routes
+                .check_budget(route)
+                .map_err(|error| FetchError::Refused(error.to_string()))?;
+            let client = match route {
+                Route::Direct => &self.client,
+                Route::Proxy => self.proxy_client.as_ref().ok_or(FetchError::Protocol)?,
+            };
+            let mut request = client.get(url.clone());
             for (name, value) in headers {
                 request = request.header(name, value);
             }
@@ -222,6 +259,8 @@ async fn read(
     _pass: Pass,
     target: &Target,
     url: Url,
+    route: Route,
+    routes: &RouteConfig,
 ) -> Result<Fetched, FetchError> {
     // Under content decoding reqwest reports no length, so this only rejects identity bodies.
     if response
@@ -237,7 +276,11 @@ async fn read(
         .filter_map(|(name, value)| Some((name.to_string(), value.to_str().ok()?.to_owned())))
         .collect();
     let mut body = BytesMut::new();
+    // shortcut: reqwest exposes decoded bodies; use metered transport for complete wire-byte billing.
     while let Some(chunk) = response.chunk().await.map_err(|e| classify(&e, &url))? {
+        routes
+            .charge(route, chunk.len())
+            .map_err(|error| FetchError::Refused(error.to_string()))?;
         if body.len() + chunk.len() > target.max_bytes {
             return Err(FetchError::TooLarge);
         }
@@ -248,6 +291,7 @@ async fn read(
         .find(|(name, _)| name == "content-type")
         .map(|(_, value)| value.clone());
     Ok(Fetched {
+        route,
         requested_url: target.url.clone(),
         final_url: url,
         status,
@@ -488,6 +532,7 @@ mod tests {
     #[test]
     fn charset_decoding() {
         let page = |content_type: Option<&str>, body: &[u8]| Fetched {
+            route: Route::Direct,
             requested_url: "http://a.example/".parse().unwrap(),
             final_url: "http://a.example/".parse().unwrap(),
             status: 200,

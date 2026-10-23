@@ -274,6 +274,7 @@ mod tests {
 
     fn response(target: Target, status: u16, body: &str) -> Fetched {
         Fetched {
+            route: crate::net::Route::Direct,
             requested_url: target.url.clone(),
             final_url: target.url,
             status,

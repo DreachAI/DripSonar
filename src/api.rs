@@ -455,7 +455,7 @@ fn metadata_json(doc: &Document, source_url: &str) -> Value {
     if let Some(content_type) = &doc.content_type {
         meta.insert("contentType".into(), json!(content_type));
     }
-    meta.insert("proxyUsed".into(), json!("basic"));
+    meta.insert("proxyUsed".into(), json!(doc.route.proxy_used()));
     let cache_state = if doc.cached_at.is_some() {
         "hit"
     } else {

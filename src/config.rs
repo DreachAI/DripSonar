@@ -21,6 +21,17 @@ pub struct Config {
     /// Ports allowed besides 80 and 443.
     #[arg(long, env = "SONAR_EXTRA_PORTS", value_delimiter = ',')]
     pub extra_ports: Vec<u16>,
+    /// Upstream proxy; only SOCKS5 with locally guarded DNS is accepted.
+    #[arg(long, env = "SONAR_PROXY", hide_env_values = true)]
+    pub proxy: Option<String>,
+    #[arg(long, env = "SONAR_PROXY_HOSTS", value_delimiter = ',')]
+    pub proxy_hosts: Vec<String>,
+    #[arg(long, env = "SONAR_PROXY_MAX_BYTES_PER_DAY")]
+    pub proxy_max_bytes_per_day: Option<u64>,
+    #[arg(long, env = "SONAR_FORWARD_PROXY_CONCURRENCY", default_value_t = 32, value_parser = at_least_one())]
+    pub forward_proxy_concurrency: usize,
+    #[arg(long, env = "SONAR_FORWARD_PROXY_IDLE_TIMEOUT_MS", default_value_t = 30_000, value_parser = clap::value_parser!(u64).range(1..=86_400_000))]
+    pub forward_proxy_idle_timeout_ms: u64,
     #[arg(long, env = "SONAR_MAX_BODY_BYTES", default_value_t = 10_485_760, value_parser = at_least_one())]
     pub max_body_bytes: usize,
     #[arg(long, env = "SONAR_GLOBAL_CONCURRENCY", default_value_t = 256, value_parser = at_least_one())]
@@ -48,6 +59,14 @@ impl fmt::Debug for Config {
             .field("user_agent", &self.user_agent)
             .field("searxng_endpoint", &self.searxng_endpoint)
             .field("extra_ports", &self.extra_ports)
+            .field("proxy", &self.proxy.as_ref().map(|_| "<redacted>"))
+            .field("proxy_hosts", &self.proxy_hosts)
+            .field("proxy_max_bytes_per_day", &self.proxy_max_bytes_per_day)
+            .field("forward_proxy_concurrency", &self.forward_proxy_concurrency)
+            .field(
+                "forward_proxy_idle_timeout_ms",
+                &self.forward_proxy_idle_timeout_ms,
+            )
             .field("max_body_bytes", &self.max_body_bytes)
             .field("global_concurrency", &self.global_concurrency)
             .field("per_host_concurrency", &self.per_host_concurrency)

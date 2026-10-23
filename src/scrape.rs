@@ -15,7 +15,7 @@ use url::Url;
 use crate::{
     config::Config,
     document::{self, DocumentError},
-    net::{FetchError, Fetched, Fetcher, Target},
+    net::{FetchError, Fetched, Fetcher, Route, Target},
     page::{self, RenderOptions, Rendered},
     store::{self, Store},
 };
@@ -35,6 +35,7 @@ pub struct ScrapeRequest {
 }
 
 pub struct Document {
+    pub route: Route,
     /// Final URL after redirects.
     pub url: Url,
     pub status: u16,
@@ -186,6 +187,7 @@ async fn finish(fetched: Fetched, req: &ScrapeRequest, hit: bool) -> Result<Docu
             .extra
             .insert("numPages".into(), pdf.pages.to_string());
         return Ok(Document {
+            route: fetched.route,
             url: fetched.final_url,
             status: fetched.status,
             content_type: Some("application/pdf".into()),
@@ -211,6 +213,7 @@ async fn finish(fetched: Fetched, req: &ScrapeRequest, hit: bool) -> Result<Docu
         Some(m) => return Err(ScrapeError::Unsupported(m.to_owned())),
     };
     Ok(Document {
+        route: fetched.route,
         url: fetched.final_url,
         status: fetched.status,
         content_type: fetched.content_type,

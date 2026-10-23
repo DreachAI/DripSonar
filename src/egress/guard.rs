@@ -13,21 +13,29 @@ use url::{Host, Url};
 /// Why a destination was refused. The resolver returns it through reqwest's error chain.
 #[derive(Debug, thiserror::Error)]
 #[error("{0}")]
-pub(super) struct Refusal(pub(super) String);
+pub(crate) struct Refusal(pub(crate) String);
 
 #[derive(Debug, thiserror::Error)]
 #[error("dns resolution failed")]
-pub(super) struct DnsFailure;
+pub(crate) struct DnsFailure;
 
-pub(super) struct Guard {
+#[derive(Debug, thiserror::Error)]
+pub(super) enum GuardError {
+    #[error(transparent)]
+    Refused(#[from] Refusal),
+    #[error(transparent)]
+    Dns(#[from] DnsFailure),
+}
+
+pub struct FetchGuard {
     extra_ports: Vec<u16>,
     /// Test-only: names resolve from this map alone, and loopback addresses are allowed.
     #[cfg(any(test, feature = "test-support"))]
-    pub(super) test_hosts: Option<HashMap<String, Vec<IpAddr>>>,
+    pub(crate) test_hosts: Option<HashMap<String, Vec<IpAddr>>>,
 }
 
-impl Guard {
-    pub(super) fn new(extra_ports: &[u16]) -> Self {
+impl FetchGuard {
+    pub fn new(extra_ports: &[u16]) -> Self {
         Self {
             extra_ports: extra_ports.to_vec(),
             #[cfg(any(test, feature = "test-support"))]
@@ -36,7 +44,7 @@ impl Guard {
     }
 
     /// Checks scheme, credentials, port, and IP-literal hosts, which bypass the resolver.
-    pub(super) fn check_url(&self, url: &Url) -> Result<(), Refusal> {
+    pub(crate) fn check_url(&self, url: &Url) -> Result<(), Refusal> {
         if !matches!(url.scheme(), "http" | "https") {
             return Err(Refusal(format!("scheme {} is not allowed", url.scheme())));
         }
@@ -78,24 +86,51 @@ impl Guard {
             .map_err(|_| DnsFailure)?;
         Ok(addrs.collect())
     }
+
+    async fn checked_lookup(&self, host: &str) -> Result<Vec<SocketAddr>, GuardError> {
+        let addrs = self.lookup(host).await?;
+        if addrs.is_empty() {
+            return Err(DnsFailure.into());
+        }
+        // Refuse mixed answers before any connection can race an unchecked address.
+        for addr in &addrs {
+            self.check_ip(addr.ip())?;
+        }
+        Ok(addrs)
+    }
+
+    pub(super) async fn resolve_url(&self, url: &Url) -> Result<Vec<SocketAddr>, GuardError> {
+        self.check_url(url)?;
+        let port = url.port_or_known_default().ok_or(DnsFailure)?;
+        let mut addrs = match url.host() {
+            Some(Host::Domain(host)) => self.checked_lookup(host).await?,
+            Some(Host::Ipv4(ip)) => vec![SocketAddr::new(IpAddr::V4(ip), port)],
+            Some(Host::Ipv6(ip)) => vec![SocketAddr::new(IpAddr::V6(ip), port)],
+            None => return Err(DnsFailure.into()),
+        };
+        for addr in &mut addrs {
+            addr.set_port(port);
+        }
+        Ok(addrs)
+    }
 }
 
 /// The reqwest resolver: connections only ever use addresses this check accepted.
-pub(super) struct GuardedResolver(pub(super) Arc<Guard>);
+pub(crate) struct GuardedResolver(pub(crate) Arc<FetchGuard>);
 
 impl Resolve for GuardedResolver {
     fn resolve(&self, name: Name) -> Resolving {
         let guard = Arc::clone(&self.0);
         let host = name.as_str().to_owned();
         Box::pin(async move {
-            let addrs = guard.lookup(&host).await?;
-            if addrs.is_empty() {
-                return Err(DnsFailure.into());
-            }
-            // One refused address refuses the whole answer, so a mixed answer cannot be raced.
-            for addr in &addrs {
-                guard.check_ip(addr.ip())?;
-            }
+            let addrs = guard.checked_lookup(&host).await.map_err(|error| {
+                // Keep the resolver's original concrete errors available to callers.
+                let error: Box<dyn std::error::Error + Send + Sync> = match error {
+                    GuardError::Refused(error) => Box::new(error),
+                    GuardError::Dns(error) => Box::new(error),
+                };
+                error
+            })?;
             Ok(Box::new(addrs.into_iter()) as Addrs)
         })
     }
@@ -148,6 +183,7 @@ fn is_public_v6(ip: Ipv6Addr) -> bool {
 #[cfg(test)]
 #[allow(clippy::unwrap_used)]
 mod tests {
+    use super::FetchGuard as Guard;
     use super::*;
 
     #[tokio::test]

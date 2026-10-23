@@ -4,6 +4,7 @@ pub mod api;
 pub mod config;
 pub mod crawl;
 pub mod document;
+pub mod egress;
 pub mod net;
 pub mod page;
 pub mod scrape;
@@ -30,6 +31,11 @@ pub(crate) mod testkit {
             user_agent: "DripSonar-test".into(),
             searxng_endpoint: None,
             extra_ports: vec![addr.port()],
+            proxy: None,
+            proxy_hosts: Vec::new(),
+            proxy_max_bytes_per_day: None,
+            forward_proxy_concurrency: 4,
+            forward_proxy_idle_timeout_ms: 30_000,
             max_body_bytes: 1000,
             global_concurrency: 1,
             per_host_concurrency: 2,

@@ -620,6 +620,7 @@ async fn prepare_capture(
                 doc.warning = Some("PDF parsing disabled".to_owned());
             } else {
                 let pdf = document::pdf_to_markdown(&body, req.deadline).await?;
+                doc.rendered.fit_markdown = req.render.fit_markdown.then(|| pdf.markdown.clone());
                 doc.rendered.markdown = req.render.markdown.then_some(pdf.markdown);
                 doc.rendered.metadata.title = pdf.title;
                 doc.rendered
@@ -694,6 +695,7 @@ fn parse_capture(
         Some(m) if m.starts_with("text/") || m == "application/json" || m.ends_with("+json") => {
             Rendered {
                 markdown: req.render.markdown.then(|| text.clone()),
+                fit_markdown: req.render.fit_markdown.then(|| text.clone()),
                 ..Rendered::default()
             }
         }

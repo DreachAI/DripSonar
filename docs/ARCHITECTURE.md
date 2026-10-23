@@ -34,7 +34,7 @@ One Cargo package, `dripsonar`: a library plus the `sonar` binary (`serve`, `scr
 | --- | --- | --- | --- |
 | `config` | Settings from flags and environment, validated once | `Config` | — |
 | `net` | Destination guard, DNS pinning, redirects, deadlines, byte caps, decoding, retries, per-host gate | `Fetcher::fetch(&Target) -> Result<Fetched, FetchError>` | config |
-| `page` | Pure HTML transforms: cleanup, main content, markdown, metadata, links | `render(&Fetched, &RenderOptions) -> Rendered` | — |
+| `page` | Pure HTML transforms: cleanup, main content, markdown, fit markdown, metadata, links | `render(&Fetched, &RenderOptions) -> Rendered` | `extract::css` (pure) |
 | `store` | SQLite metadata and content-addressed blob files; capture cache | `Store::{cached, put}` | net (types only) |
 | `scrape` | One scrape: cache, single-flight, fetch, classify, render | `Scraper::scrape(&ScrapeRequest) -> Result<Document, ScrapeError>` | net, page, store |
 | `search` | Search providers and optional per-result scraping | `Searcher::search(&SearchRequest) -> Result<Vec<Hit>, SearchError>` | net, scrape |
@@ -330,6 +330,36 @@ type leaves `browser`.
   Reported token counts accumulate across attempts and formats in `metadata.llmUsage` without
   inventing missing counts. Extraction is per caller, not cached or persisted. No monetary spend cap
   is implemented; operator enablement and request/token/concurrency limits bound individual work.
+
+### Fit markdown (`page::fit`)
+
+- As built: DripSonar extension format `fitMarkdown` (v1 string, v2 `{type:"fitMarkdown"}`),
+  returned as `data.fitMarkdown`; jobs accept it. Runs in the bounded blocking render path.
+- `dom_smoothie` 0.18 readability runs on the cleaned body (after include/exclude tags, before
+  main-content selectors); under 200 visible characters, the cleaned body stands in. Pruning then
+  drops boilerplate tags and comments, removes any element whose class or id contains `nav`,
+  `footer`, `header`, `sidebar`, `ads`, `comment`, `promo`, `advert`, `social`, or `share`, and
+  walks top-down removing subtrees scoring under 0.48 on 0.4·text density + 0.2·(1 − direct-link
+  text share) + 0.2·tag weight + 0.1·ln(text length + 1) (Crawl4AI's pruning filter,
+  reimplemented). Images and other void elements are not scored; they go with their container.
+- Links become `text⟨N⟩` and images `![alt⟨N⟩]`, numbering unique http(s) URLs in first-seen
+  order, followed by `## References` lines `⟨N⟩ url: title` (title attribute, else link text).
+- When `onlyMainContent` selectors leave under 200 visible characters, the readability article
+  also feeds `markdown`; Firecrawl's selector path stays primary. Plain text and PDFs return
+  their markdown unchanged as `fitMarkdown`.
+
+### CSS extraction (`extract::css`)
+
+- As built: zero-spend structured extraction through v1 `jsonOptions.selectors` or v2
+  `{type:"json", selectors}` with a Crawl4AI-like schema `{baseSelector?, fields:[{name,
+  selector?, type: text|attribute|html|list|nested, attribute?, fields?}]}`. A field without
+  `selector` reads the element in scope. `data.json` is an array (one object per `baseSelector`
+  match) or one object for the page. Text is whitespace-collapsed; missing matches are `null`.
+- Validated before collection (valid selectors, unique names, at most 100 fields, nesting depth
+  4); runs on the original DOM in the render path, capped at 1000 matches per selection and a
+  2M-node work budget, past which `json` is `null` with a warning. Selectors win over an LLM
+  schema in the same request, so no LLM call is made, and work without `SONAR_LLM_URL`. Jobs
+  still reject the json format.
 
 Change tracking from stored captures and the company-signal layers remain later work in
 [BUILDOUT.md](BUILDOUT.md).

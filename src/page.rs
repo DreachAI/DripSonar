@@ -1,9 +1,13 @@
 //! Pure HTML transforms: cleanup, main content, markdown, metadata, links.
 
+mod fit;
+
 use std::collections::{BTreeMap, HashSet};
 
 use dom_query::{Document, Selection};
 use url::Url;
+
+use crate::extract::css;
 
 pub(crate) const MAX_INPUT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_EXTRA_ENTRIES: usize = 100;
@@ -44,6 +48,12 @@ pub struct RenderOptions {
     /// Firecrawl's `parsePDF: false`: a PDF yields no text. Absent in stored job templates.
     #[serde(default)]
     pub skip_pdf_parsing: bool,
+    /// DripSonar's `fitMarkdown` format: readability, pruning, citation-style links.
+    #[serde(default)]
+    pub fit_markdown: bool,
+    /// Deterministic CSS extraction into `json`; never set for jobs.
+    #[serde(default)]
+    pub selectors: Option<css::Schema>,
 }
 
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
@@ -75,6 +85,11 @@ pub struct PageMetadata {
 #[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
 pub struct Rendered {
     pub markdown: Option<String>,
+    #[serde(default)]
+    pub fit_markdown: Option<String>,
+    /// CSS extraction result; never persisted by jobs, which refuse the json format.
+    #[serde(default)]
+    pub json: Option<serde_json::Value>,
     pub html: Option<String>,
     pub links: Option<Vec<String>>,
     pub metadata: PageMetadata,
@@ -96,6 +111,10 @@ pub(crate) fn render_document(doc: Document, base_url: &Url, opts: &RenderOption
         .unwrap_or_else(|| base_url.clone());
     let metadata = metadata(&doc, &base);
     let links = opts.links.then(|| links(&doc, &base));
+    let json = opts
+        .selectors
+        .as_ref()
+        .map(|schema| css::extract(&doc, schema));
 
     doc.select(STRIP_TAGS).remove();
     // Selection used to reparse the body in a fresh wrapper; keep that selector scope.
@@ -112,8 +131,9 @@ pub(crate) fn render_document(doc: Document, base_url: &Url, opts: &RenderOption
     for selector in &opts.exclude_tags {
         remove_matches(&doc, selector, false);
     }
-    let full = opts
-        .only_main_content
+    fix_images(&doc, opts.remove_base64_images);
+    absolutize(&doc, &base);
+    let full = (opts.only_main_content || opts.fit_markdown)
         .then(|| doc.select("body").inner_html().to_string());
     if opts.only_main_content {
         remove_matches(&doc, NON_MAIN, true);
@@ -121,22 +141,33 @@ pub(crate) fn render_document(doc: Document, base_url: &Url, opts: &RenderOption
     let mut body = doc;
     // Some sites wrap all their text in a non-main class; an empty page helps nobody.
     if !has_text(&body)
-        && let Some(full) = full
+        && let Some(full) = &full
     {
         let fallback = Document::from(format!("<body>{full}</body>"));
         if has_text(&fallback) {
             body = fallback;
         }
     }
-    fix_images(&body, opts.remove_base64_images);
-    absolutize(&body, &base);
 
     let cleaned = body.select("body").inner_html().to_string();
+    // Firecrawl's selectors stay primary; readability stands in when they leave a thin page.
+    let thin = opts.markdown
+        && opts.only_main_content
+        && fit::text_chars(&body.select("body").text()) < fit::MIN_TEXT_CHARS;
+    let article = (thin || opts.fit_markdown)
+        .then(|| full.as_deref().and_then(fit::readable))
+        .flatten();
+    let source = article.as_deref().filter(|_| thin).unwrap_or(&cleaned);
     let markdown = opts
         .markdown
-        .then(|| cap_blank_runs(&htmd::convert(&cleaned).unwrap_or_default()));
+        .then(|| cap_blank_runs(&htmd::convert(source).unwrap_or_default()));
+    let fit_markdown = opts
+        .fit_markdown
+        .then(|| fit::markdown(article.as_deref().or(full.as_deref()).unwrap_or_default()));
     Rendered {
         markdown,
+        fit_markdown,
+        json,
         html: opts.html.then_some(cleaned),
         links,
         metadata,

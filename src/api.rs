@@ -155,7 +155,9 @@ impl AppState {
             .formats
             .clone()
             .unwrap_or_else(|| default_formats.to_vec());
-        let extraction = formats.contains(&Format::Json) || formats.contains(&Format::Summary);
+        let selectors = opts.json_options.as_ref().and_then(|o| o.selectors.clone());
+        let extraction = formats.contains(&Format::Summary)
+            || (formats.contains(&Format::Json) && selectors.is_none());
         if extraction {
             self.extractor()?;
         }
@@ -181,6 +183,8 @@ impl AppState {
                 html: formats.contains(&Format::Html),
                 links: formats.contains(&Format::Links),
                 skip_pdf_parsing: !opts.parse_pdf.unwrap_or(true),
+                fit_markdown: formats.contains(&Format::FitMarkdown),
+                selectors,
             },
             raw_html: formats.contains(&Format::RawHtml),
         };
@@ -207,8 +211,21 @@ impl AppState {
         let mut data = document_json(doc, formats, source_url);
         let mut usage = Usage::default();
         let mut warning = doc.warning.clone();
+        let css = opts
+            .json_options
+            .as_ref()
+            .is_some_and(|options| options.selectors.is_some());
         for format in [Format::Json, Format::Summary] {
             if !formats.contains(&format) {
+                continue;
+            }
+            if format == Format::Json && css {
+                let value = doc.rendered.json.clone().unwrap_or(Value::Null);
+                if value.is_null() {
+                    let message = "json: CSS extraction needs an HTML page within the work limit";
+                    extract::append_warning(&mut warning, message);
+                }
+                data.insert("json".into(), value);
                 continue;
             }
             let summary = JsonOptions {
@@ -314,6 +331,8 @@ pub fn router(state: AppState) -> Router {
 #[serde(rename_all = "camelCase")]
 pub(crate) enum Format {
     Markdown,
+    /// DripSonar extension: pruned main content with numbered references.
+    FitMarkdown,
     Html,
     RawHtml,
     Links,
@@ -680,6 +699,10 @@ pub(crate) fn document_json(
                 "markdown",
                 json!(rendered.markdown.clone().unwrap_or_default()),
             ),
+            Format::FitMarkdown => (
+                "fitMarkdown",
+                json!(rendered.fit_markdown.clone().unwrap_or_default()),
+            ),
             Format::Html => ("html", json!(rendered.html.clone().unwrap_or_default())),
             Format::RawHtml => ("rawHtml", json!(doc.raw_html.clone().unwrap_or_default())),
             Format::Links => ("links", json!(rendered.links.clone().unwrap_or_default())),
@@ -740,11 +763,13 @@ fn hit_json(hit: &Hit) -> Map<String, Value> {
 fn has_content(doc: &Map<String, Value>) -> bool {
     doc.contains_key("json")
         || doc.contains_key("summary")
-        || ["markdown", "html", "rawHtml"].iter().any(|key| {
-            doc.get(*key)
-                .and_then(Value::as_str)
-                .is_some_and(|s| !s.is_empty())
-        })
+        || ["markdown", "fitMarkdown", "html", "rawHtml"]
+            .iter()
+            .any(|key| {
+                doc.get(*key)
+                    .and_then(Value::as_str)
+                    .is_some_and(|s| !s.is_empty())
+            })
 }
 
 /// The Firecrawl error table in docs/ARCHITECTURE.md.

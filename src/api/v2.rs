@@ -81,7 +81,7 @@ fn scrape_options(
         for format in formats {
             let (name, mut options) = variant(format, "formats")?;
             let format = match name.as_str() {
-                "markdown" | "html" | "rawHtml" | "links" => name,
+                "markdown" | "fitMarkdown" | "html" | "rawHtml" | "links" => name,
                 "json" => {
                     if body.contains_key("jsonOptions") {
                         return Err(ApiError::bad_request(
@@ -90,8 +90,12 @@ fn scrape_options(
                     }
                     let schema: Option<Value> = take(&mut options, "schema")?;
                     let prompt: Option<String> = take(&mut options, "prompt")?;
+                    let selectors: Option<Value> = take(&mut options, "selectors")?;
                     no_fields(&options, "formats.json")?;
                     let mut json_options = Map::new();
+                    if let Some(selectors) = selectors {
+                        json_options.insert("selectors".into(), selectors);
+                    }
                     if let Some(schema) = schema {
                         json_options.insert("schema".into(), schema);
                     }

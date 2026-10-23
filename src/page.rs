@@ -4,7 +4,7 @@ mod fit;
 
 use std::collections::{BTreeMap, HashSet};
 
-use dom_query::{Document, Selection};
+use dom_query::{Document, NodeRef, Selection};
 use url::Url;
 
 use crate::extract::css;
@@ -13,6 +13,10 @@ pub(crate) const MAX_INPUT_BYTES: usize = 10 * 1024 * 1024;
 const MAX_EXTRA_ENTRIES: usize = 100;
 const MAX_EXTRA_CHARS: usize = 1000;
 const SMALL_BODY_BYTES: usize = 20 * 1024;
+/// Past this many elements or levels of nesting, CSS extraction refuses and fit markdown skips
+/// readability: both walk the tree repeatedly.
+const MAX_DOM_ELEMENTS: usize = 200_000;
+const MAX_DOM_DEPTH: usize = 256;
 
 const STRIP_TAGS: &str = "script, style, noscript, template, meta, link";
 const NON_MAIN: &str = "header, footer, nav, aside, .header, .top, .navbar, #header, .footer, \
@@ -135,6 +139,12 @@ pub(crate) fn render_document(doc: Document, base_url: &Url, opts: &RenderOption
     absolutize(&doc, &base);
     let full = (opts.only_main_content || opts.fit_markdown)
         .then(|| doc.select("body").inner_html().to_string());
+    let fit_markdown = opts.fit_markdown.then(|| {
+        fit::markdown(
+            full.as_deref().unwrap_or_default(),
+            dom_within_limits(doc.root()),
+        )
+    });
     if opts.only_main_content {
         remove_matches(&doc, NON_MAIN, true);
     }
@@ -150,20 +160,9 @@ pub(crate) fn render_document(doc: Document, base_url: &Url, opts: &RenderOption
     }
 
     let cleaned = body.select("body").inner_html().to_string();
-    // Firecrawl's selectors stay primary; readability stands in when they leave a thin page.
-    let thin = opts.markdown
-        && opts.only_main_content
-        && fit::text_chars(&body.select("body").text()) < fit::MIN_TEXT_CHARS;
-    let article = (thin || opts.fit_markdown)
-        .then(|| full.as_deref().and_then(fit::readable))
-        .flatten();
-    let source = article.as_deref().filter(|_| thin).unwrap_or(&cleaned);
     let markdown = opts
         .markdown
-        .then(|| cap_blank_runs(&htmd::convert(source).unwrap_or_default()));
-    let fit_markdown = opts
-        .fit_markdown
-        .then(|| fit::markdown(article.as_deref().or(full.as_deref()).unwrap_or_default()));
+        .then(|| cap_blank_runs(&htmd::convert(&cleaned).unwrap_or_default()));
     Rendered {
         markdown,
         fit_markdown,
@@ -215,6 +214,21 @@ fn truncate(s: &str, max: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Whether the tree under `root` stays within `MAX_DOM_ELEMENTS` and `MAX_DOM_DEPTH`; the walk
+/// is iterative and stops at the first excess.
+pub(crate) fn dom_within_limits(root: NodeRef) -> bool {
+    let mut stack = vec![(root, 0)];
+    let mut elements = 0;
+    while let Some((node, depth)) = stack.pop() {
+        elements += usize::from(node.is_element());
+        if depth > MAX_DOM_DEPTH || elements > MAX_DOM_ELEMENTS {
+            return false;
+        }
+        stack.extend(node.children_it(false).map(|child| (child, depth + 1)));
+    }
+    true
 }
 
 fn has_text(body: &Document) -> bool {

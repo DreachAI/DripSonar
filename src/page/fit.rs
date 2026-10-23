@@ -2,37 +2,60 @@
 //!
 //! The pruning score follows Crawl4AI's `PruningContentFilter` as specified, reimplemented here.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
-use dom_query::{Document, NodeId, NodeRef};
+use dom_query::{Document, NodeId, NodeRef, Selection};
 use dom_smoothie::{Config, Readability};
 use url::Url;
 
-/// Below this many visible characters a readability article (or a main-content body) is thin.
-pub(super) const MIN_TEXT_CHARS: usize = 200;
+/// Below this many visible characters a readability article is thin; the body stands in.
+const MIN_TEXT_CHARS: usize = 200;
+/// Readability scores the tree in several passes, so it stops short of the page DOM limit.
+const READABILITY_MAX_ELEMENTS: usize = 100_000;
 const PRUNE_THRESHOLD: f64 = 0.48;
+/// Pruning that keeps less than 1/`MIN_KEPT_FRACTION` of the text misjudged the page.
+const MIN_KEPT_FRACTION: usize = 5;
 const BOILERPLATE_TAGS: &str = "nav, footer, header, aside, script, style, form, iframe, noscript";
+/// Boilerplate class and id names never remove these or their ancestors.
+const CONTENT_MARKERS: &str = "main, article, [role=main]";
 /// Leaf elements carry no text of their own; they stand or fall with their container.
 const VOID_TAGS: [&str; 4] = ["img", "br", "hr", "wbr"];
 /// Private-use markers around image citations, so the converter leaves `![`/`]` unescaped.
 const IMAGE_OPEN: char = '\u{E000}';
 const IMAGE_CLOSE: char = '\u{E001}';
 
-/// A class or id containing any of these, case-insensitively, marks boilerplate.
-const BOILERPLATE_NAMES: [&str; 10] = [
-    "nav", "footer", "header", "sidebar", "ads", "comment", "promo", "advert", "social", "share",
+/// A class or id with any of these as a whole token (split on non-alphanumerics, any case) marks
+/// boilerplate.
+const BOILERPLATE_NAMES: [&str; 13] = [
+    "nav", "footer", "header", "sidebar", "ads", "ad", "comment", "comments", "promo", "advert",
+    "social", "share", "sharing",
 ];
 
-pub(super) fn text_chars(text: &str) -> usize {
+fn text_chars(text: &str) -> usize {
     text.chars().filter(|c| !c.is_whitespace()).count()
 }
 
+/// Renders the cleaned body HTML as fit markdown. Readability runs only when `readable_dom`
+/// (the page DOM is within limits); otherwise the body is pruned directly.
+pub(super) fn markdown(body_html: &str, readable_dom: bool) -> String {
+    let article = readable_dom.then(|| readable(body_html)).flatten();
+    let html = article.as_deref().unwrap_or(body_html);
+    let mut doc = parse_body(html);
+    let before = visible_chars(&doc);
+    prune(&doc);
+    if visible_chars(&doc) * MIN_KEPT_FRACTION < before {
+        doc = parse_body(html);
+    }
+    render(&doc)
+}
+
 /// The readability article's HTML, when it holds at least `MIN_TEXT_CHARS` visible characters.
-pub(super) fn readable(body_html: &str) -> Option<String> {
+fn readable(body_html: &str) -> Option<String> {
     let config = Config {
         // Pruning reads class and id names after readability.
         keep_classes: true,
         disable_json_ld: true,
+        max_elements_to_parse: READABILITY_MAX_ELEMENTS,
         ..Config::default()
     };
     let article = Readability::new(body_html, None, Some(config))
@@ -42,18 +65,26 @@ pub(super) fn readable(body_html: &str) -> Option<String> {
     (text_chars(&article.text_content) >= MIN_TEXT_CHARS).then(|| article.content.to_string())
 }
 
-/// Prunes the article (or body) HTML and renders it as markdown with numbered references.
-pub(super) fn markdown(html: &str) -> String {
+fn parse_body(html: &str) -> Document {
     let doc = Document::from(format!("<body>{html}</body>"));
+    if let Some(body) = doc.body() {
+        for node in body.descendants().iter().filter(|n| n.is_comment()) {
+            node.remove_from_parent();
+        }
+    }
+    doc
+}
+
+fn visible_chars(doc: &Document) -> usize {
+    text_chars(&doc.select("body").text())
+}
+
+/// Converts the body to markdown with numbered references.
+fn render(doc: &Document) -> String {
     let Some(body) = doc.body() else {
         return String::new();
     };
-    doc.select(BOILERPLATE_TAGS).remove();
-    for node in body.descendants().iter().filter(|n| n.is_comment()) {
-        node.remove_from_parent();
-    }
-    prune(&body);
-    let references = cite(&doc);
+    let references = cite(doc);
     let converted = htmd::convert(&body.inner_html()).unwrap_or_default();
     let mut out = super::cap_blank_runs(&converted)
         .replace(IMAGE_OPEN, "![")
@@ -63,12 +94,33 @@ pub(super) fn markdown(html: &str) -> String {
         let lines: Vec<String> = references
             .iter()
             .enumerate()
-            .map(|(i, (url, title))| match title.as_str() {
+            .map(|(i, (url, title))| match escape_reference(title).as_str() {
                 "" => format!("⟨{}⟩ {url}", i + 1),
                 title => format!("⟨{}⟩ {url}: {title}", i + 1),
             })
             .collect();
         out.push_str(&lines.join("\n"));
+    }
+    out
+}
+
+/// Collapses whitespace (so no newline survives) and backslash-escapes characters that could
+/// forge markup or a reference marker.
+fn escape_reference(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for word in text.split_whitespace() {
+        if !out.is_empty() {
+            out.push(' ');
+        }
+        for c in word.chars() {
+            if matches!(
+                c,
+                '\\' | '[' | ']' | '*' | '_' | '`' | '<' | '>' | '⟨' | '⟩'
+            ) {
+                out.push('\\');
+            }
+            out.push(c);
+        }
     }
     out
 }
@@ -79,16 +131,24 @@ struct Stats {
     inner: usize,
     outer: usize,
     links: usize,
+    image: bool,
+    linked_image: bool,
 }
 
-/// Walks top-down, dropping boilerplate-named elements and subtrees scoring under the threshold.
-fn prune(body: &NodeRef) {
-    let stats = measure(body);
+/// Drops boilerplate tags, then walks top-down, dropping boilerplate-named elements and subtrees
+/// scoring under the threshold.
+fn prune(doc: &Document) {
+    doc.select(BOILERPLATE_TAGS).remove();
+    let Some(body) = doc.body() else {
+        return;
+    };
+    let stats = measure(&body);
+    let protected = content_and_ancestors(&body);
     let mut stack = body.element_children();
     while let Some(node) = stack.pop() {
-        if node.class().is_some_and(|v| boilerplate(&v))
-            || node.id_attr().is_some_and(|v| boilerplate(&v))
-        {
+        let named = node.class().is_some_and(|v| boilerplate(&v))
+            || node.id_attr().is_some_and(|v| boilerplate(&v));
+        if named && !protected.contains(&node.id) {
             node.remove_from_parent();
             continue;
         }
@@ -97,6 +157,11 @@ fn prune(body: &NodeRef) {
             continue;
         }
         let s = stats.get(&node.id).copied().unwrap_or_default();
+        // A linked image has no text to score; it stands or falls with its first scored container.
+        if s.text == 0 && s.linked_image {
+            stack.extend(node.element_children());
+            continue;
+        }
         let density = s.text as f64 / s.inner.max(1) as f64;
         let link_density = s.links as f64 / s.text.max(1) as f64;
         let score = 0.4 * density
@@ -111,9 +176,25 @@ fn prune(body: &NodeRef) {
     }
 }
 
+/// Every `CONTENT_MARKERS` element and its ancestors; each node is visited once.
+fn content_and_ancestors(body: &NodeRef) -> HashSet<NodeId> {
+    let mut ids = HashSet::new();
+    for node in Selection::from(*body).select(CONTENT_MARKERS).nodes() {
+        for n in std::iter::once(*node).chain(node.ancestors_it(None)) {
+            if !ids.insert(n.id) {
+                break;
+            }
+        }
+    }
+    ids
+}
+
 fn boilerplate(name: &str) -> bool {
-    let name = name.to_ascii_lowercase();
-    BOILERPLATE_NAMES.iter().any(|word| name.contains(word))
+    name.split(|c: char| !c.is_alphanumeric()).any(|token| {
+        BOILERPLATE_NAMES
+            .iter()
+            .any(|w| token.eq_ignore_ascii_case(w))
+    })
 }
 
 fn tag_weight(name: &str) -> f64 {
@@ -130,8 +211,23 @@ fn tag_weight(name: &str) -> f64 {
     }
 }
 
-/// Per-element stripped text length, approximate inner and outer markup length, and the text
-/// of direct `<a>` children, in one bottom-up pass (linear, no recursion).
+/// Characters a value takes once serialized: `&`, `<`, `>` and no-break spaces in text, and `&`,
+/// `"` and no-break spaces in attributes, become entities.
+fn escaped_chars(value: &str, attribute: bool) -> usize {
+    value
+        .chars()
+        .map(|c| match c {
+            '&' => 5,
+            '\u{a0}' => 6,
+            '<' | '>' if !attribute => 4,
+            '"' if attribute => 6,
+            _ => 1,
+        })
+        .sum()
+}
+
+/// Per-element stripped text length, inner and outer serialized length, the text of direct `<a>`
+/// children, and image presence, in characters, in one bottom-up pass (linear, no recursion).
 fn measure(body: &NodeRef) -> HashMap<NodeId, Stats> {
     let mut stats: HashMap<NodeId, Stats> = HashMap::new();
     for node in body.descendants().iter().rev().filter(|n| n.is_element()) {
@@ -140,22 +236,31 @@ fn measure(body: &NodeRef) -> HashMap<NodeId, Stats> {
             if child.is_text() {
                 let text = child.text();
                 s.text += text.trim().chars().count();
-                s.inner += text.len();
+                s.inner += escaped_chars(&text, false);
             } else if let Some(c) = stats.get(&child.id).copied() {
                 s.text += c.text;
                 s.inner += c.outer;
+                s.image |= c.image;
+                s.linked_image |= c.linked_image;
                 if child.has_name("a") {
                     s.links += c.text;
                 }
             }
         }
-        let name = node.node_name().map_or(0, |n| n.len());
+        let name = node.node_name().unwrap_or_default();
+        s.image |= name.as_ref() == "img";
+        s.linked_image |= s.image && name.as_ref() == "a";
+        let name_chars = name.chars().count();
         let attrs: usize = node
             .attrs()
             .iter()
-            .map(|a| a.name.local.len() + a.value.len() + 4)
+            .map(|a| a.name.local.chars().count() + escaped_chars(&a.value, true) + 4)
             .sum();
-        s.outer = s.inner + 2 * name + 5 + attrs;
+        // `<name attrs>`, plus `</name>` unless void.
+        s.outer = s.inner + name_chars + 2 + attrs;
+        if !VOID_TAGS.contains(&name.as_ref()) {
+            s.outer += name_chars + 3;
+        }
         stats.insert(node.id, s);
     }
     stats
